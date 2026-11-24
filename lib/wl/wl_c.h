@@ -1,12 +1,4 @@
-#include <fcntl.h>
-#include <poll.h>
-#include <time.h>
-#include <unistd.h>
 #include <linux/input-event-codes.h>
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <xf86drm.h>
-#include <drm_fourcc.h>
 #include <wayland-client.h>
 #include <xdg-shell-client-protocol.h>
 #include <xdg-decoration-unstable-v1-client-protocol.h>

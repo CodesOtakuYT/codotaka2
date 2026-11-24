@@ -4,7 +4,7 @@
 // Client-side title bar: background, title text and minimize/maximize/close buttons,
 // all procedural so it is resolution independent under fractional scaling.
 
-#include "font8x8.glsl"
+#include "font8x8.glsl" // from lib/bitmap_font (include path set by the build)
 
 layout(push_constant) uniform Push {
     vec2 size;         // view size in buffer pixels
