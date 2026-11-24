@@ -51,7 +51,8 @@ pub const Content = struct {
 
     pub const VTable = struct {
         update: *const fn (ptr: *anyopaque, ft: FrameTime) Update,
-        draw: *const fn (ptr: *anyopaque, ctx: DrawContext) frame.Draw,
+        /// Appends this content's draws (in order) for the viewport.
+        draw: *const fn (ptr: *anyopaque, ctx: DrawContext, out: *frame.DrawList) anyerror!void,
     };
 };
 
@@ -105,6 +106,7 @@ pub fn Scene(comptime Target: type) type {
             /// Places nodes and viewports for the current window size/state.
             layout: *const fn (ctx: *anyopaque, sw: *SceneWindow) anyerror!void,
             pointer: ?*const fn (ctx: *anyopaque, sw: *SceneWindow, ev: wl.PointerEvent) void = null,
+            key: ?*const fn (ctx: *anyopaque, sw: *SceneWindow, ev: wl.KeyEvent) void = null,
         };
 
         pub const SceneWindow = struct {
@@ -150,6 +152,7 @@ pub fn Scene(comptime Target: type) type {
                 self.root = try self.nodes.insert(gpa, root_node);
                 try self.node_order.append(gpa, self.root);
                 window.pointer_handler = .{ .ctx = self, .func = onPointer };
+                window.key_handler = .{ .ctx = self, .func = onKey };
                 return self;
             }
 
@@ -294,6 +297,11 @@ pub fn Scene(comptime Target: type) type {
                 if (self.hooks.pointer) |f| f(self.hooks.ctx, self, ev);
             }
 
+            fn onKey(ctx: *anyopaque, ev: wl.KeyEvent) void {
+                const self: *SceneWindow = @ptrCast(@alignCast(ctx));
+                if (self.hooks.key) |f| f(self.hooks.ctx, self, ev);
+            }
+
             fn relayout(self: *SceneWindow) !void {
                 const w = self.window;
                 w.layout_dirty = false;
@@ -356,7 +364,14 @@ pub fn Scene(comptime Target: type) type {
                             if (!p.node.eql(nid)) continue;
                             const scissor = scale.rect(p.region);
                             const size_px = [2]f32{ scale.coordF(@intCast(v.width)), scale.coordF(@intCast(v.height)) };
-                            try views.append(arena, .{
+                            var list: frame.DrawList = .{ .arena = arena };
+                            try v.content.vtable.draw(v.content.ptr, .{
+                                .size_px = size_px,
+                                .scale = scale.factor(),
+                                .white_scale = self.white_scale,
+                                .color = self.color,
+                            }, &list);
+                            for (list.draws.items) |d| try views.append(arena, .{
                                 .viewport = .{
                                     .x = scale.coordF(p.region.x - p.offset_x),
                                     .y = scale.coordF(p.region.y - p.offset_y),
@@ -364,12 +379,7 @@ pub fn Scene(comptime Target: type) type {
                                     .height = size_px[1],
                                 },
                                 .scissor = scissor,
-                                .draw = v.content.vtable.draw(v.content.ptr, .{
-                                    .size_px = size_px,
-                                    .scale = scale.factor(),
-                                    .white_scale = self.white_scale,
-                                    .color = self.color,
-                                }),
+                                .draw = d,
                             });
                             if (!full and v.dirty) try damage.append(arena, scissor);
                         }

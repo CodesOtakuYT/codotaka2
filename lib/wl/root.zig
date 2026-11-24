@@ -26,6 +26,42 @@ pub const PointerEvent = struct {
     time: u32 = 0,
 };
 
+pub const Modifiers = bitpack struct(u8) {
+    shift: bool = false,
+    ctrl: bool = false,
+    alt: bool = false,
+    super: bool = false,
+    caps_lock: bool = false,
+    _: u3 = 0,
+};
+
+pub const KeyEvent = struct {
+    kind: enum { press, release, repeat },
+    /// xkb keysym (see xkbcommon-keysyms.h, re-exported as `wl.keysym`).
+    keysym: u32,
+    /// UTF-8 text produced by this key (after compose), if any.
+    text_buf: [16]u8 = undefined,
+    text_len: u8 = 0,
+    mods: Modifiers = .{},
+    serial: u32 = 0,
+    time: u32 = 0,
+
+    pub fn text(e: *const KeyEvent) []const u8 {
+        return e.text_buf[0..e.text_len];
+    }
+};
+
+/// Common keysyms.
+pub const keysym = struct {
+    pub const BackSpace: u32 = c.XKB_KEY_BackSpace;
+    pub const Return: u32 = c.XKB_KEY_Return;
+    pub const KP_Enter: u32 = c.XKB_KEY_KP_Enter;
+    pub const Escape: u32 = c.XKB_KEY_Escape;
+    pub const Tab: u32 = c.XKB_KEY_Tab;
+    pub const Delete: u32 = c.XKB_KEY_Delete;
+    pub const q: u32 = c.XKB_KEY_q;
+};
+
 pub const Button = struct {
     pub const left: u32 = c.BTN_LEFT;
     pub const right: u32 = c.BTN_RIGHT;

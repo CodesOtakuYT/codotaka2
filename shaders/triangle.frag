@@ -1,6 +1,9 @@
-#version 450
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-layout(push_constant) uniform Push {
+layout(push_constant, scalar) uniform Push {
+    uint64_t data;
     float angle;
     float intensity;
     float white_scale;

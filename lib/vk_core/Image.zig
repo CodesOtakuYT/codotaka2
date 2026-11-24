@@ -21,6 +21,8 @@ pub const Options = struct {
     drm_modifiers: ?[]const u64 = null,
     /// Export the memory as a dmabuf (dedicated allocation).
     export_dma_buf: bool = false,
+    /// Skip creating a VkImageView (e.g. images only referenced through descriptor heaps).
+    no_view: bool = false,
 };
 
 pub const color_range: vk.ImageSubresourceRange = .{
@@ -71,14 +73,64 @@ pub fn create(device: *Device, opts: Options) !Image {
     });
     try dev.bindImageMemory(self.image, self.memory, 0);
 
-    self.view = try dev.createImageView(&.{
+    if (!opts.no_view) self.view = try dev.createImageView(&self.viewInfo(), null);
+    return self;
+}
+
+/// The view description used for both VkImageView and descriptor-heap image descriptors.
+pub fn viewInfo(self: *const Image) vk.ImageViewCreateInfo {
+    return .{
         .image = self.image,
         .view_type = .@"2d",
-        .format = opts.format,
+        .format = self.format,
         .components = .{ .r = .identity, .g = .identity, .b = .identity, .a = .identity },
         .subresource_range = color_range,
-    }, null);
-    return self;
+    };
+}
+
+/// Host-side layout transition (VK_EXT_host_image_copy / Vulkan 1.4). Needs HOST_TRANSFER usage.
+pub fn hostTransition(self: *const Image, device: *Device, old: vk.ImageLayout, new: vk.ImageLayout) !void {
+    try device.proxy.transitionImageLayout(&.{.{
+        .image = self.image,
+        .old_layout = old,
+        .new_layout = new,
+        .subresource_range = color_range,
+    }});
+}
+
+pub const HostRegion = struct {
+    pixels: []const u8,
+    /// Row length in texels of `pixels` (0 = tightly packed).
+    row_length: u32 = 0,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+};
+
+/// Copies host memory straight into the image (no staging buffer, no command buffer).
+/// The image must be in GENERAL and the written regions must not be in use by the device.
+pub fn copyFromHost(self: *const Image, device: *Device, regions: []const HostRegion) !void {
+    var copies: [16]vk.MemoryToImageCopy = undefined;
+    var i: usize = 0;
+    while (i < regions.len) {
+        const n = @min(copies.len, regions.len - i);
+        for (regions[i..][0..n], copies[0..n]) |r, *cp| cp.* = .{
+            .p_host_pointer = r.pixels.ptr,
+            .memory_row_length = r.row_length,
+            .memory_image_height = 0,
+            .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+            .image_offset = .{ .x = r.x, .y = r.y, .z = 0 },
+            .image_extent = .{ .width = r.width, .height = r.height, .depth = 1 },
+        };
+        try device.proxy.copyMemoryToImage(&.{
+            .dst_image = self.image,
+            .dst_image_layout = .general,
+            .region_count = @intCast(n),
+            .p_regions = &copies,
+        });
+        i += n;
+    }
 }
 
 pub fn deinit(self: *Image, device: *Device) void {

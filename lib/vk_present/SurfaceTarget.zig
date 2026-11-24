@@ -243,26 +243,27 @@ fn createBuffer(self: *SurfaceTarget, choice: dmabuf_feedback.Choice) !*Buffer {
     return b;
 }
 
-/// Takes ownership of `b` from the compositor and makes it renderable.
+/// Makes `b` renderable. Its previous contents are discarded (we redraw everything), so
+/// per the spec the ownership acquire from the compositor is skipped: a plain
+/// UNDEFINED -> GENERAL transition suffices. With unified image layouts, GENERAL is the
+/// only layout these images ever use.
 pub fn begin(self: *SurfaceTarget, cmd: vk.CommandBufferProxy, b: *Buffer) Presenter.Recorder.Target {
-    // Contents are discarded (UNDEFINED): the renderer clears the whole target.
     vk_core.barrier.image(cmd, .{
         .image = b.image.image,
         .old_layout = .undefined,
-        .new_layout = .color_attachment_optimal,
+        .new_layout = .general,
         .dst_stage = .{ .color_attachment_output = true },
-        .dst_access = .{ .color_attachment_write = true },
-        .src_queue_family = vk.QUEUE_FAMILY_FOREIGN_EXT,
-        .dst_queue_family = self.presenter.device.queue_family,
+        .dst_access = .{ .color_attachment_write = true, .color_attachment_read = true },
     });
     return .{ .view = b.image.view, .extent = b.image.extent, .format = self.format.vk };
 }
 
-/// Hands `b` back to the compositor's (foreign) queue family.
+/// Releases `b` to the compositor (foreign queue family). Layout stays GENERAL; the
+/// release is what makes the memory match the advertised DRM modifier.
 pub fn end(self: *SurfaceTarget, cmd: vk.CommandBufferProxy, b: *Buffer) void {
     vk_core.barrier.image(cmd, .{
         .image = b.image.image,
-        .old_layout = .color_attachment_optimal,
+        .old_layout = .general,
         .new_layout = .general,
         .src_stage = .{ .color_attachment_output = true },
         .src_access = .{ .color_attachment_write = true },

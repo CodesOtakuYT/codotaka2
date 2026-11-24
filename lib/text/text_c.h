@@ -1,0 +1,10 @@
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_OUTLINE_H
+#include <fontconfig/fontconfig.h>
+#include <hb.h>
+#include <hb-ot.h>
+#include <linebreak.h>
+#include <graphemebreak.h>
+#include <wordbreak.h>
+#include <SheenBidi/SheenBidi.h>

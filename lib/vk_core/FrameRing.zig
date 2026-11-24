@@ -5,6 +5,7 @@ const FrameRing = @This();
 const std = @import("std");
 const vk = @import("vulkan");
 const Device = @import("Device.zig");
+const Buffer = @import("Buffer.zig");
 
 pub const frames_in_flight = 3;
 
@@ -14,6 +15,9 @@ pub const Frame = struct {
     done: vk.Semaphore,
     /// Device timeline value signalled when this frame's work completes.
     value: u64 = 0,
+    /// Per-frame transient data (instances, uniforms) addressed from shaders by device
+    /// address; reset when the frame is reused.
+    upload: Buffer.Linear,
 
     pub fn commands(f: *const Frame, device: *Device) vk.CommandBufferProxy {
         return vk.CommandBufferProxy.init(f.cmd, &device.vkd);
@@ -28,6 +32,8 @@ index: usize = 0,
 pub const Options = struct {
     /// Make `Frame.done` exportable as a sync_file.
     export_sync_fd: bool = false,
+    /// Size of each frame's transient upload buffer.
+    upload_size: u64 = 4 << 20,
 };
 
 pub fn init(device: *Device, opts: Options) !FrameRing {
@@ -47,23 +53,34 @@ pub fn init(device: *Device, opts: Options) !FrameRing {
 
     var self: FrameRing = .{ .device = device, .pool = pool, .frames = undefined };
     var created: usize = 0;
-    errdefer for (self.frames[0..created]) |f| dev.destroySemaphore(f.done, null);
+    errdefer for (self.frames[0..created]) |*f| destroyFrame(device, f);
     const export_info: vk.ExportSemaphoreCreateInfo = .{ .handle_types = .{ .sync_fd = true } };
     for (&self.frames, cmds) |*f, cmd| {
+        var upload = try Buffer.create(device, .{
+            .size = opts.upload_size,
+            .usage = .{ .storage_buffer = true, .shader_device_address = true },
+            .host_visible = true,
+        });
+        errdefer upload.deinit(device);
         f.* = .{
             .cmd = cmd,
             .done = try dev.createSemaphore(&.{ .p_next = if (opts.export_sync_fd) &export_info else null }, null),
+            .upload = .{ .buffer = upload },
         };
         created += 1;
     }
     return self;
 }
 
+fn destroyFrame(device: *Device, f: *Frame) void {
+    device.proxy.destroySemaphore(f.done, null);
+    f.upload.buffer.deinit(device);
+}
+
 /// The device must be idle.
 pub fn deinit(self: *FrameRing) void {
-    const dev = self.device.proxy;
-    for (self.frames) |f| dev.destroySemaphore(f.done, null);
-    dev.destroyCommandPool(self.pool, null);
+    for (&self.frames) |*f| destroyFrame(self.device, f);
+    self.device.proxy.destroyCommandPool(self.pool, null);
 }
 
 /// The next frame if its previous use has completed, with its command buffer reset and
@@ -71,6 +88,7 @@ pub fn deinit(self: *FrameRing) void {
 pub fn begin(self: *FrameRing, completed_value: u64) !?*Frame {
     const f = &self.frames[self.index];
     if (completed_value < f.value) return null;
+    f.upload.reset();
     const cmd = f.commands(self.device);
     try cmd.resetCommandBuffer(.{});
     try cmd.beginCommandBuffer(&.{ .flags = .{ .one_time_submit = true } });

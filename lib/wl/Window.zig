@@ -15,6 +15,11 @@ pub const PointerHandler = struct {
     func: *const fn (ctx: *anyopaque, ev: wl.PointerEvent) void,
 };
 
+pub const KeyHandler = struct {
+    ctx: *anyopaque,
+    func: *const fn (ctx: *anyopaque, ev: wl.KeyEvent) void,
+};
+
 display: *Display,
 root: *Surface,
 subsurfaces: std.ArrayList(*Surface) = .empty,
@@ -24,6 +29,7 @@ decoration: ?*c.zxdg_toplevel_decoration_v1 = null,
 fractional_scale: *c.wp_fractional_scale_v1,
 frame_callback: ?*c.wl_callback = null,
 pointer_handler: ?PointerHandler = null,
+key_handler: ?KeyHandler = null,
 
 /// Logical window geometry size (includes client-side decorations).
 width: u32 = 800,
@@ -79,6 +85,7 @@ pub fn create(display: *Display, title: [:0]const u8, app_id: [:0]const u8) !*Wi
 
 pub fn destroy(self: *Window) void {
     const gpa = self.display.gpa;
+    if (self.display.keyboard_focus == self) self.display.keyboardLost();
     if (self.frame_callback) |cb| c.wl_callback_destroy(cb);
     for (self.subsurfaces.items) |s| s.destroy();
     self.subsurfaces.deinit(gpa);
@@ -128,6 +135,10 @@ pub fn commitTree(self: *Window) void {
 
 pub fn onPointer(self: *Window, ev: wl.PointerEvent) void {
     if (self.pointer_handler) |h| h.func(h.ctx, ev);
+}
+
+pub fn onKey(self: *Window, ev: wl.KeyEvent) void {
+    if (self.key_handler) |h| h.func(h.ctx, ev);
 }
 
 // Window-management requests (used by client-side decorations).

@@ -6,6 +6,7 @@ const Io = std.Io;
 const wl = @import("wl");
 const vk_core = @import("vk_core");
 const vk_present = @import("vk_present");
+const text = @import("text");
 const Gpu = @import("Gpu.zig");
 const EventLoop = @import("EventLoop.zig");
 const metrics = @import("metrics.zig");
@@ -30,6 +31,7 @@ const usage =
     \\Usage: codotaka [--hdr] [window-count]
     \\  --hdr   render FP16 scRGB and tag surfaces with the Windows-scRGB image description
     \\Middle-click the top-left view to promote/demote it to its own subsurface.
+    \\Type into the bottom field; Ctrl+Q closes a window.
     \\
 ;
 
@@ -87,6 +89,7 @@ const App = struct {
     io: Io,
     color: wl.ColorMode,
     display: *wl.Display,
+    fonts: *text.FontSystem,
     instance: *vk_core.Instance,
     gpus: []*Gpu,
     entries: std.ArrayList(Entry) = .empty,
@@ -96,6 +99,8 @@ const App = struct {
     fn init(gpa: Allocator, io: Io, window_count: usize, color: wl.ColorMode) !App {
         const display = try wl.Display.connect(gpa);
         errdefer display.disconnect();
+        const fonts = try text.FontSystem.create(gpa, "sans-serif");
+        errdefer fonts.destroy();
         const instance = try vk_core.Instance.create(gpa, .{ .app_name = "codotaka", .validation = builtin.mode == .debug });
         errdefer instance.destroy();
 
@@ -109,7 +114,7 @@ const App = struct {
         }
         for (candidates) |cand| {
             try gpus.ensureUnusedCapacity(gpa, 1);
-            gpus.appendAssumeCapacity(try Gpu.create(gpa, instance, cand));
+            gpus.appendAssumeCapacity(try Gpu.create(gpa, instance, cand, &fonts.glyphs));
         }
 
         var app: App = .{
@@ -117,6 +122,7 @@ const App = struct {
             .io = io,
             .color = color,
             .display = display,
+            .fonts = fonts,
             .instance = instance,
             .gpus = try gpus.toOwnedSlice(gpa),
         };
@@ -133,6 +139,7 @@ const App = struct {
         for (app.gpus) |g| g.destroy();
         app.gpa.free(app.gpus);
         app.instance.destroy();
+        app.fonts.destroy();
         app.display.disconnect();
         app.* = undefined;
     }
@@ -167,7 +174,7 @@ const App = struct {
                 return Scene.SceneWindow.create(c.gpa, c.window, c.root_target, c.binding.color, vk_present.formats.forMode(c.binding.color).white_scale, c.binding.factory(), hooks);
             }
         };
-        const dw = demo.Window.create(gpa, index, title, Creator{ .gpa = gpa, .window = window, .root_target = root_target, .binding = binding }) catch |err| {
+        const dw = demo.Window.create(gpa, app.fonts, index, title, Creator{ .gpa = gpa, .window = window, .root_target = root_target, .binding = binding }) catch |err| {
             root_target.destroy();
             return err;
         };
@@ -208,6 +215,7 @@ const App = struct {
 
         while (app.entries.items.len > 0) {
             try app.display.wait(&.{}, 0);
+            app.display.tickRepeat(app.nowNs());
 
             var i: usize = 0;
             while (i < app.entries.items.len) {
@@ -237,7 +245,9 @@ const App = struct {
             loop.reset();
 
             for (trees) |*t| t.* = .empty;
+            if (app.display.repeatDeadline()) |t| loop.addDeadline(t);
             for (app.entries.items) |e| {
+                e.window.syncFocus();
                 const sw = e.window.sw;
                 if (try sw.plan(arena, sw.frameTime(now))) |tree| {
                     const gi = std.mem.indexOfScalar(*Gpu, app.gpus, e.binding.gpu).?;

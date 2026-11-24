@@ -26,11 +26,13 @@ pub const TreeWork = frame.TreeWork(SurfaceTarget);
 /// What the presenter needs to know about the GPU's DRM nodes.
 pub const DrmInfo = vk.PhysicalDeviceDrmPropertiesEXT;
 
-/// Records the views of one target. Called inside the presenter's command buffer, with the
-/// target in COLOR_ATTACHMENT_OPTIMAL layout.
+/// Records the views of one target into the presenter's command buffer. The target is in
+/// GENERAL layout; `upload` is this frame's transient device-addressable memory.
 pub const Recorder = struct {
     ctx: *anyopaque,
-    record: *const fn (ctx: *anyopaque, cmd: vk.CommandBufferProxy, target: Target, views: []const frame.View) anyerror!void,
+    /// Called once per frame before any target, after heaps could be bound.
+    begin_frame: *const fn (ctx: *anyopaque, cmd: vk.CommandBufferProxy) anyerror!void,
+    record: *const fn (ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.Linear, target: Target, views: []const frame.View) anyerror!void,
 
     pub const Target = struct {
         view: vk.ImageView,
@@ -192,9 +194,10 @@ pub fn renderFrame(self: *Presenter, arena: Allocator, trees: []const TreeWork, 
             return;
         };
         const cmd = f.commands(self.device);
+        try recorder.begin_frame(recorder.ctx, cmd);
         for (slots.items) |slot| {
             const target = slot.target.begin(cmd, slot.buffer);
-            try recorder.record(recorder.ctx, cmd, target, slot.work.views);
+            try recorder.record(recorder.ctx, cmd, &f.upload, target, slot.work.views);
             slot.target.end(cmd, slot.buffer);
         }
         const value = try self.ring.submit(f);

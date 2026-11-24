@@ -1,9 +1,12 @@
-#version 450
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-layout(push_constant) uniform Push {
+layout(push_constant, scalar) uniform Push {
+    uint64_t data;     // unused
     float angle;
     float intensity;   // 1.0 = reference white
-    float white_scale; // output value of reference white (1.0 SDR, 203/80 for scRGB)
+    float white_scale; // output value of reference white (1.0 SDR, 203/80 scRGB)
 } pc;
 
 layout(location = 0) out vec3 v_color;

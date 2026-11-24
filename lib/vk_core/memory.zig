@@ -30,25 +30,35 @@ pub const AllocOptions = struct {
     dedicated_image: vk.Image = .null,
     /// External handle types this allocation can be exported as.
     export_handle_types: vk.ExternalMemoryHandleTypeFlags = .{},
+    /// Allow vkGetBufferDeviceAddress on buffers bound to this memory.
+    device_address: bool = false,
 };
 
 pub fn allocate(dev: vk.DeviceProxy, memory: *const Memory, reqs: vk.MemoryRequirements, opts: AllocOptions) !vk.DeviceMemory {
     const type_index = memory.findType(reqs.memory_type_bits, opts.required, opts.preferred) orelse
         return error.NoSuitableMemoryType;
-    const dedicated: vk.MemoryDedicatedAllocateInfo = .{ .image = opts.dedicated_image };
-    const exporting: vk.ExportMemoryAllocateInfo = .{
-        .p_next = if (opts.dedicated_image != .null) &dedicated else null,
-        .handle_types = opts.export_handle_types,
-    };
-    const p_next: ?*const anyopaque = if (opts.export_handle_types.toInt() != 0)
-        &exporting
-    else if (opts.dedicated_image != .null)
-        &dedicated
-    else
-        null;
+
+    // Build the pNext chain back to front from whichever structures apply.
+    var next: ?*const anyopaque = null;
+    const flags_info: vk.MemoryAllocateFlagsInfo = .{ .flags = .{ .device_address = true }, .device_mask = 0 };
+    if (opts.device_address) next = &flags_info;
+    var dedicated: vk.MemoryDedicatedAllocateInfo = .{ .image = opts.dedicated_image };
+    if (opts.dedicated_image != .null) {
+        dedicated.p_next = next;
+        next = &dedicated;
+    }
+    var exporting: vk.ExportMemoryAllocateInfo = .{ .handle_types = opts.export_handle_types };
+    if (opts.export_handle_types.toInt() != 0) {
+        exporting.p_next = next;
+        next = &exporting;
+    }
     return dev.allocateMemory(&.{
-        .p_next = p_next,
+        .p_next = next,
         .allocation_size = reqs.size,
         .memory_type_index = type_index,
     }, null);
+}
+
+pub fn alignForward(v: u64, a: u64) u64 {
+    return if (a == 0) v else std.mem.alignForward(u64, v, a);
 }

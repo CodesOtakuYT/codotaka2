@@ -3,18 +3,26 @@
 const std = @import("std");
 const geom = @import("geom");
 const wl = @import("wl");
+const Allocator = std.mem.Allocator;
 
-pub const max_push = 128;
+/// Program-specific push data, after the renderer's 8-byte data address.
+pub const max_push = 120;
 
-/// A draw: which program (an id the renderer understands) and its push-constant block.
+/// A draw: which program (an id the renderer understands), its push data, and optional
+/// per-draw data the renderer uploads to transient GPU memory. Shaders receive the data's
+/// device address as the first 8 bytes of push data.
 pub const Draw = struct {
     program: u32,
     push: [max_push]u8 align(4) = undefined,
     push_len: u8 = 0,
+    /// Arena-owned; valid until the frame is recorded.
+    data: []const u8 = &.{},
+    vertex_count: u32 = 3,
+    instance_count: u32 = 1,
 
     pub fn init(program: u32, push: anytype) Draw {
         const T = @TypeOf(push);
-        comptime std.debug.assert(@sizeOf(T) <= max_push);
+        comptime std.debug.assert(@sizeOf(T) <= max_push and @sizeOf(T) % 4 == 0);
         var d: Draw = .{ .program = program, .push_len = @sizeOf(T) };
         @memcpy(d.push[0..@sizeOf(T)], std.mem.asBytes(&push));
         return d;
@@ -25,7 +33,17 @@ pub const Draw = struct {
     }
 };
 
-/// One region of one target showing (part of) a logical viewport, in buffer pixels.
+/// Where content appends its draws for one viewport.
+pub const DrawList = struct {
+    arena: Allocator,
+    draws: std.ArrayList(Draw) = .empty,
+
+    pub fn add(l: *DrawList, d: Draw) !void {
+        try l.draws.append(l.arena, d);
+    }
+};
+
+/// One draw into one region of one target, in buffer pixels.
 pub const View = struct {
     /// Where the *whole* logical viewport lies in target pixels; may extend past the target,
     /// so a viewport split across several targets renders with continuous content.

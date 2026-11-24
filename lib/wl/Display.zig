@@ -7,6 +7,7 @@ const linux = std.os.linux;
 const c = @import("wl_c");
 const listener = @import("listener.zig").listener;
 const Surface = @import("Surface.zig");
+const Window = @import("Window.zig");
 const root = @import("root.zig");
 const Allocator = std.mem.Allocator;
 
@@ -41,6 +42,18 @@ pointer_focus: ?*Surface = null,
 pointer_serial: u32 = 0,
 pointer_x: f64 = 0,
 pointer_y: f64 = 0,
+
+keyboard: ?*c.wl_keyboard = null,
+xkb_context: ?*c.xkb_context = null,
+xkb_keymap: ?*c.xkb_keymap = null,
+xkb_state: ?*c.xkb_state = null,
+compose_table: ?*c.xkb_compose_table = null,
+compose_state: ?*c.xkb_compose_state = null,
+keyboard_focus: ?*Window = null,
+/// Keys per second and initial delay (ms) from wl_keyboard.repeat_info.
+repeat_rate: i32 = 25,
+repeat_delay: i32 = 600,
+repeat: ?struct { keycode: u32, event: root.KeyEvent, next_ns: i128 } = null,
 
 pub fn connect(gpa: Allocator) !*Display {
     const display = c.wl_display_connect(null) orelse return error.WaylandConnectFailed;
@@ -80,6 +93,8 @@ pub fn disconnect(self: *Display) void {
     for (&self.descriptions.values) |*d| if (d.*) |desc| c.wp_image_description_v1_destroy(desc);
     if (self.cursor_shape_device) |d| c.wp_cursor_shape_device_v1_destroy(d);
     if (self.pointer) |p| c.wl_pointer_destroy(p);
+    self.destroyKeyboard();
+    if (self.xkb_context) |x| c.xkb_context_unref(x);
     if (self.seat) |s| c.wl_seat_destroy(s);
     if (self.cursor_shape_manager) |m| c.wp_cursor_shape_manager_v1_destroy(m);
     if (self.color_manager) |m| c.wp_color_manager_v1_destroy(m);
@@ -169,6 +184,63 @@ pub fn imageDescription(self: *Display, mode: root.ColorMode) !?*c.wp_image_desc
 
 pub fn setCursor(self: *Display, shape: u32) void {
     if (self.cursor_shape_device) |d| c.wp_cursor_shape_device_v1_set_shape(d, self.pointer_serial, shape);
+}
+
+/// When the next key repeat is due (CLOCK_MONOTONIC ns), if a key is held.
+pub fn repeatDeadline(self: *const Display) ?i128 {
+    return if (self.repeat) |r| r.next_ns else null;
+}
+
+/// Delivers due key repeats. Call after waking for `repeatDeadline`.
+pub fn tickRepeat(self: *Display, now_ns: i128) void {
+    const r = &(self.repeat orelse return);
+    const interval: i128 = @divFloor(std.time.ns_per_s, @max(1, self.repeat_rate));
+    while (r.next_ns <= now_ns) : (r.next_ns += interval) {
+        const focus = self.keyboard_focus orelse break;
+        focus.onKey(r.event);
+        if (self.repeat == null) return; // handler closed the window
+    }
+}
+
+pub fn monotonicNs() i128 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+pub fn keyboardLost(self: *Display) void {
+    self.keyboard_focus = null;
+    self.repeat = null;
+}
+
+fn destroyKeyboard(self: *Display) void {
+    if (self.compose_state) |s| c.xkb_compose_state_unref(s);
+    if (self.compose_table) |t| c.xkb_compose_table_unref(t);
+    if (self.xkb_state) |s| c.xkb_state_unref(s);
+    if (self.xkb_keymap) |k| c.xkb_keymap_unref(k);
+    if (self.keyboard) |k| c.wl_keyboard_release(k);
+    self.compose_state = null;
+    self.compose_table = null;
+    self.xkb_state = null;
+    self.xkb_keymap = null;
+    self.keyboard = null;
+    self.keyboardLost();
+}
+
+fn modifiers(self: *const Display) root.Modifiers {
+    const st = self.xkb_state orelse return .{};
+    const active = struct {
+        fn f(s: *c.xkb_state, name: [*:0]const u8) bool {
+            return c.xkb_state_mod_name_is_active(s, name, c.XKB_STATE_MODS_EFFECTIVE) > 0;
+        }
+    }.f;
+    return .{
+        .shift = active(st, c.XKB_MOD_NAME_SHIFT),
+        .ctrl = active(st, c.XKB_MOD_NAME_CTRL),
+        .alt = active(st, c.XKB_MOD_NAME_ALT),
+        .super = active(st, c.XKB_MOD_NAME_LOGO),
+        .caps_lock = active(st, c.XKB_MOD_NAME_CAPS),
+    };
 }
 
 fn bit(v: anytype) u32 {
@@ -271,6 +343,14 @@ const ColorManagerHandlers = struct {
 
 const SeatHandlers = struct {
     pub fn capabilities(self: *Display, seat: ?*c.wl_seat, caps: u32) callconv(.c) void {
+        const has_keyboard = caps & c.WL_SEAT_CAPABILITY_KEYBOARD != 0;
+        if (has_keyboard and self.keyboard == null) {
+            if (self.xkb_context == null) self.xkb_context = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
+            self.keyboard = c.wl_seat_get_keyboard(seat);
+            _ = c.wl_keyboard_add_listener(self.keyboard, &keyboard_listener, self);
+        } else if (!has_keyboard and self.keyboard != null) {
+            self.destroyKeyboard();
+        }
         const has_pointer = caps & c.WL_SEAT_CAPABILITY_POINTER != 0;
         if (has_pointer and self.pointer == null) {
             self.pointer = c.wl_seat_get_pointer(seat);
@@ -315,6 +395,99 @@ const PointerHandlers = struct {
     }
 };
 
+const KeyboardHandlers = struct {
+    pub fn keymap(self: *Display, _: ?*c.wl_keyboard, format: u32, fd: i32, size: u32) callconv(.c) void {
+        defer _ = linux.close(fd);
+        if (format != c.WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) return;
+        const rc = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+        if (linux.errno(rc) != .SUCCESS) return;
+        const map: [*]const u8 = @ptrFromInt(rc);
+        defer _ = linux.munmap(map, size);
+        const ctx = self.xkb_context orelse return;
+        const keymap_new = c.xkb_keymap_new_from_buffer(ctx, map, size - 1, c.XKB_KEYMAP_FORMAT_TEXT_V1, c.XKB_KEYMAP_COMPILE_NO_FLAGS) orelse {
+            log.err("failed to compile keymap", .{});
+            return;
+        };
+        const state = c.xkb_state_new(keymap_new) orelse {
+            c.xkb_keymap_unref(keymap_new);
+            return;
+        };
+        if (self.xkb_state) |s| c.xkb_state_unref(s);
+        if (self.xkb_keymap) |k| c.xkb_keymap_unref(k);
+        self.xkb_keymap = keymap_new;
+        self.xkb_state = state;
+        if (self.compose_table == null) {
+            const locale = std.c.getenv("LC_ALL") orelse std.c.getenv("LC_CTYPE") orelse std.c.getenv("LANG") orelse "C";
+            self.compose_table = c.xkb_compose_table_new_from_locale(ctx, locale, c.XKB_COMPOSE_COMPILE_NO_FLAGS);
+            if (self.compose_table) |t| self.compose_state = c.xkb_compose_state_new(t, c.XKB_COMPOSE_STATE_NO_FLAGS);
+        }
+    }
+    pub fn enter(self: *Display, _: ?*c.wl_keyboard, _: u32, surface: ?*c.wl_surface, _: [*c]c.wl_array) callconv(.c) void {
+        const s: ?*Surface = if (surface) |ws| @ptrCast(@alignCast(c.wl_surface_get_user_data(ws))) else null;
+        self.keyboard_focus = if (s) |ss| ss.window else null;
+    }
+    pub fn leave(self: *Display, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surface) callconv(.c) void {
+        self.keyboardLost();
+    }
+    pub fn key(self: *Display, _: ?*c.wl_keyboard, serial: u32, time: u32, raw: u32, state: u32) callconv(.c) void {
+        const xs = self.xkb_state orelse return;
+        const keycode = raw + 8; // evdev -> xkb
+        const pressed = state == c.WL_KEYBOARD_KEY_STATE_PRESSED;
+        if (!pressed) {
+            if (self.repeat) |r| if (r.keycode == keycode) {
+                self.repeat = null;
+            };
+        }
+        var ev: root.KeyEvent = .{
+            .kind = if (pressed) .press else .release,
+            .keysym = c.xkb_state_key_get_one_sym(xs, keycode),
+            .mods = self.modifiers(),
+            .serial = serial,
+            .time = time,
+        };
+        if (pressed) {
+            // Compose (dead keys, Multi_key sequences), else the plain key text.
+            var plain = true;
+            if (self.compose_state) |cs| if (c.xkb_compose_state_feed(cs, ev.keysym) == c.XKB_COMPOSE_FEED_ACCEPTED) {
+                switch (c.xkb_compose_state_get_status(cs)) {
+                    c.XKB_COMPOSE_COMPOSING => plain = false,
+                    c.XKB_COMPOSE_COMPOSED => {
+                        const n = c.xkb_compose_state_get_utf8(cs, &ev.text_buf, ev.text_buf.len);
+                        ev.text_len = @intCast(@min(n, ev.text_buf.len - 1));
+                        ev.keysym = c.xkb_compose_state_get_one_sym(cs);
+                        c.xkb_compose_state_reset(cs);
+                        plain = false;
+                    },
+                    c.XKB_COMPOSE_CANCELLED => {
+                        c.xkb_compose_state_reset(cs);
+                        plain = false;
+                    },
+                    else => {},
+                }
+            };
+            if (plain) {
+                const n = c.xkb_state_key_get_utf8(xs, keycode, &ev.text_buf, ev.text_buf.len);
+                ev.text_len = @intCast(@min(@max(n, 0), ev.text_buf.len - 1));
+            }
+            if (self.repeat_rate > 0 and c.xkb_keymap_key_repeats(self.xkb_keymap, keycode) != 0) {
+                var rep = ev;
+                rep.kind = .repeat;
+                self.repeat = .{ .keycode = keycode, .event = rep, .next_ns = monotonicNs() + @as(i128, self.repeat_delay) * std.time.ns_per_ms };
+            }
+        }
+        if (self.keyboard_focus) |w| w.onKey(ev);
+    }
+    pub fn modifiers(self: *Display, _: ?*c.wl_keyboard, _: u32, depressed: u32, latched: u32, locked: u32, group: u32) callconv(.c) void {
+        if (self.xkb_state) |s| _ = c.xkb_state_update_mask(s, depressed, latched, locked, 0, 0, group);
+    }
+    pub fn repeat_info(self: *Display, _: ?*c.wl_keyboard, rate: i32, delay: i32) callconv(.c) void {
+        self.repeat_rate = rate;
+        self.repeat_delay = delay;
+        if (rate == 0) self.repeat = null;
+    }
+};
+
+const keyboard_listener = listener(c.wl_keyboard_listener, KeyboardHandlers, Display);
 const registry_listener = listener(c.wl_registry_listener, RegistryHandlers, Display);
 const wm_base_listener = listener(c.xdg_wm_base_listener, WmBaseHandlers, Display);
 const presentation_listener = listener(c.wp_presentation_listener, PresentationHandlers, Display);

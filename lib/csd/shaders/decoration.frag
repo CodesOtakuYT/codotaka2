@@ -1,20 +1,17 @@
-#version 450
-#extension GL_GOOGLE_include_directive : require
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// Client-side title bar: background, title text and minimize/maximize/close buttons,
-// all procedural so it is resolution independent under fractional scaling.
+// Client-side title bar: background and minimize/maximize/close buttons, procedural so it
+// is resolution independent under fractional scaling. The title is drawn as shaped text.
 
-#include "font8x8.glsl" // from lib/bitmap_font (include path set by the build)
-
-layout(push_constant) uniform Push {
+layout(push_constant, scalar) uniform Push {
+    uint64_t data;     // unused
     vec2 size;         // view size in buffer pixels
     float scale;       // buffer pixels per logical pixel
     float white_scale; // output value of reference white
     uint hover;        // 0 none, 1 minimize, 2 maximize, 3 close
     uint flags;        // bit 0 focused, bit 1 maximized, bit 2 pressed
-    uint title_len;
-    uint pad;
-    uint chars[16];    // up to 64 ASCII characters, 4 per uint
 } pc;
 
 layout(location = 0) in vec2 v_uv;
@@ -31,23 +28,6 @@ float segment(vec2 p, vec2 a, vec2 b) {
 float boxOutline(vec2 p, vec2 center, vec2 half_size) {
     vec2 d = abs(p - center) - half_size;
     return abs(length(max(d, 0.0)) + min(max(d.x, d.y), 0.0));
-}
-
-uint charAt(uint i) {
-    return (pc.chars[i >> 2] >> ((i & 3u) * 8u)) & 0xffu;
-}
-
-float glyph(vec2 q, vec2 origin, float px) {
-    vec2 local = (q - origin) / px; // in font pixels
-    if (local.y < 0.0 || local.y >= 8.0 || local.x < 0.0) return 0.0;
-    uint col = uint(local.x) / 8u;
-    if (col >= pc.title_len) return 0.0;
-    uint ch = charAt(col);
-    if (ch < 32u || ch > 126u) ch = 63u; // '?'
-    uvec2 g = FONT8X8[ch - 32u];
-    uint row = uint(local.y);
-    uint bits = (row < 4u ? g.x : g.y) >> ((row & 3u) * 8u);
-    return float((bits >> (uint(local.x) & 7u)) & 1u);
 }
 
 void main() {
@@ -94,11 +74,6 @@ void main() {
         }
         vec3 icon = (button == 3u && button == pc.hover) ? srgb(vec3(1.0)) : fg;
         color = mix(color, icon, 1.0 - smoothstep(0.5, 0.5 + aa, d));
-    } else {
-        // Title text, 8x8 font at 2 logical px per font pixel, vertically centered.
-        float px = max(1.0, floor(2.0 * pc.scale + 0.5)) / pc.scale;
-        vec2 origin = vec2(10.0, floor((h - 8.0 * px) * 0.5 * pc.scale) / pc.scale);
-        color = mix(color, fg, glyph(q, origin, px));
     }
 
     // 1px separator at the bottom.

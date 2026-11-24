@@ -1,11 +1,12 @@
 //! Client-side decorations as ordinary scene content (no libdecor, no server-side
-//! decorations): a title bar node + viewport drawn by `shaders/decoration.frag`, plus
-//! resize edges. The state machine is window-system policy only; drawing goes through a
-//! program id the application registers for the decoration shaders.
+//! decorations): a title bar node + viewport drawn by `shaders/decoration.frag` (bar and
+//! buttons) plus a shaped text title, and resize edges. Drawing goes through program ids
+//! the application registers for the decoration shaders and for text.
 const std = @import("std");
 const wl = @import("wl");
 const frame = @import("frame");
 const scene = @import("scene");
+const text = @import("text");
 const Allocator = std.mem.Allocator;
 
 /// Title bar height, logical pixels.
@@ -16,17 +17,17 @@ const double_click_ms = 400;
 
 const Button = enum(u32) { none = 0, minimize = 1, maximize = 2, close = 3 };
 
-/// Push constants for shaders/decoration.frag.
+/// Push data for shaders/decoration.frag (after the renderer's 8-byte data address).
 pub const Push = extern struct {
     size: [2]f32,
     scale: f32,
     white_scale: f32,
     hover: u32,
     flags: u32,
-    title_len: u32,
-    pad: u32 = 0,
-    chars: [16]u32,
 };
+
+pub const Programs = struct { decoration: u32, text: u32 };
+const title_size = 14;
 
 pub fn Decoration(comptime S: type) type {
     return struct {
@@ -35,7 +36,12 @@ pub fn Decoration(comptime S: type) type {
         gpa: Allocator,
         /// Set with `attach` before the first layout.
         sw: *S.SceneWindow = undefined,
-        program: u32,
+        programs: Programs,
+        fonts: *text.FontSystem,
+        /// Title layout cache (rebuilt when the scale changes).
+        title_layout: ?text.Layout = null,
+        title_scale: f32 = 0,
+        title_arena: std.heap.ArenaAllocator,
         node: ?S.NodeId = null,
         viewport: ?S.ViewportId = null,
         title: [64]u8 = undefined,
@@ -50,9 +56,9 @@ pub fn Decoration(comptime S: type) type {
         last_click_ms: ?u32 = null,
         cursor: ?wl.CursorShape = null,
 
-        pub fn create(gpa: Allocator, program: u32, title: []const u8) !*Self {
+        pub fn create(gpa: Allocator, programs: Programs, fonts: *text.FontSystem, title: []const u8) !*Self {
             const self = try gpa.create(Self);
-            self.* = .{ .gpa = gpa, .program = program };
+            self.* = .{ .gpa = gpa, .programs = programs, .fonts = fonts, .title_arena = .init(gpa) };
             self.title_len = @min(title.len, self.title.len);
             @memcpy(self.title[0..self.title_len], title[0..self.title_len]);
             return self;
@@ -64,6 +70,7 @@ pub fn Decoration(comptime S: type) type {
 
         /// The scene's nodes/viewports are owned by the SceneWindow.
         pub fn destroy(self: *Self) void {
+            self.title_arena.deinit();
             self.gpa.destroy(self);
         }
 
@@ -105,12 +112,12 @@ pub fn Decoration(comptime S: type) type {
             return .{ .dirty = dirty };
         }
 
-        fn draw(ptr: *anyopaque, ctx: scene.DrawContext) frame.Draw {
+        fn draw(ptr: *anyopaque, ctx: scene.DrawContext, out: *frame.DrawList) !void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             const w = self.sw.window;
             self.drawn_focused = w.activated;
             self.drawn_maximized = w.maximized;
-            var push: Push = .{
+            try out.add(.init(self.programs.decoration, Push{
                 .size = ctx.size_px,
                 .scale = ctx.scale,
                 .white_scale = ctx.white_scale,
@@ -118,11 +125,35 @@ pub fn Decoration(comptime S: type) type {
                 .flags = @as(u32, @intFromBool(w.activated)) |
                     (@as(u32, @intFromBool(w.maximized)) << 1) |
                     (@as(u32, @intFromBool(self.pressed != .none and self.pressed == self.hover)) << 2),
-                .title_len = @intCast(self.title_len),
-                .chars = @splat(0),
-            };
-            @memcpy(std.mem.sliceAsBytes(&push.chars)[0..self.title_len], self.title[0..self.title_len]);
-            return .init(self.program, push);
+            }));
+
+            // Title: shaped once per scale, clipped before the buttons.
+            if (self.title_layout == null or self.title_scale != ctx.scale) {
+                _ = self.title_arena.reset(.retain_capacity);
+                const gray: f32 = 0.79; // ~sRGB 0.9
+                self.title_layout = try text.layout(self.fonts, self.title_arena.allocator(), self.title[0..self.title_len], .{
+                    .size_px = title_size * ctx.scale,
+                    .max_width = null,
+                    .color = .{ gray, gray, gray, 1 },
+                });
+                self.title_scale = ctx.scale;
+            }
+            const l = self.title_layout.?;
+            if (l.lines.len == 0) return;
+            const origin_x = @round(10 * ctx.scale);
+            const origin_y = @round((ctx.size_px[1] - l.lines[0].baseline * 2 + title_size * ctx.scale * 0.25) / 2);
+            const limit = ctx.size_px[0] - 3 * bar_height * ctx.scale - origin_x;
+            const dim: f32 = if (w.activated) 1 else 0.6;
+            var quads: std.ArrayList(text.Quad) = .empty;
+            for (l.quads) |q| {
+                if (q.x > limit) continue;
+                var moved = q;
+                moved.x += origin_x;
+                moved.y += origin_y;
+                for (&moved.color) |*ch| ch.* *= dim;
+                try quads.append(out.arena, moved);
+            }
+            try out.add(text.draw(self.programs.text, quads.items, ctx.size_px, ctx.white_scale));
         }
 
         fn buttonAt(self: *const Self, x: f64, y: f64) Button {

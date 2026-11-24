@@ -5,23 +5,24 @@ const Gpu = @This();
 const std = @import("std");
 const vk_core = @import("vk_core");
 const vk_present = @import("vk_present");
+const text = @import("text");
 const Renderer = @import("Renderer.zig");
 const Allocator = std.mem.Allocator;
 
 gpa: Allocator,
 device: *vk_core.Device,
 presenter: *vk_present.Presenter,
-renderer: Renderer,
+renderer: *Renderer,
 /// Reset at the start of each frame; only touched by this GPU's task.
 arena: std.heap.ArenaAllocator,
 
-pub fn create(gpa: Allocator, instance: *vk_core.Instance, candidate: vk_core.Instance.Candidate) !*Gpu {
+pub fn create(gpa: Allocator, instance: *vk_core.Instance, candidate: vk_core.Instance.Candidate, glyphs: *const text.GlyphCache) !*Gpu {
     const device = try vk_core.Device.create(gpa, instance, candidate, .{ .extensions = &vk_present.device_extensions });
     errdefer device.destroy();
     const presenter = try vk_present.Presenter.create(gpa, device, vk_present.drmInfo(instance, candidate.pdev));
     errdefer presenter.destroy();
-    var renderer = try Renderer.init(gpa, device);
-    errdefer renderer.deinit();
+    const renderer = try Renderer.create(gpa, device, glyphs);
+    errdefer renderer.destroy();
 
     const self = try gpa.create(Gpu);
     self.* = .{ .gpa = gpa, .device = device, .presenter = presenter, .renderer = renderer, .arena = .init(gpa) };
@@ -31,7 +32,7 @@ pub fn create(gpa: Allocator, instance: *vk_core.Instance, candidate: vk_core.In
 /// All surface targets on this GPU must be destroyed first.
 pub fn destroy(self: *Gpu) void {
     self.device.waitIdle();
-    self.renderer.deinit();
+    self.renderer.destroy();
     self.presenter.destroy();
     self.device.destroy();
     self.arena.deinit();

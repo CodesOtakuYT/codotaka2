@@ -9,3 +9,5 @@
 #include <presentation-time-client-protocol.h>
 #include <color-management-v1-client-protocol.h>
 #include <cursor-shape-v1-client-protocol.h>
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-compose.h>
