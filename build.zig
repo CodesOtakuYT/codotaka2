@@ -129,7 +129,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const av_libs = [_][]const u8{ "libavformat", "libavcodec", "libavutil" };
+    const av_libs = [_][]const u8{ "libavformat", "libavcodec", "libavutil", "libswresample" };
     for (av_libs) |lib| av_c_translate.linkSystemLibrary(lib, .{});
     const media = b.addModule("media", .{
         .root_source_file = b.path("lib/media/root.zig"),
@@ -143,6 +143,17 @@ pub fn build(b: *std.Build) void {
         },
     });
     for (av_libs) |lib| media.linkSystemLibrary(lib, .{});
+    // PipeWire playback through a small C shim (SPA's format builders are macro/inline heavy).
+    const pw_c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("lib/media/pw_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    pw_c_translate.addIncludePath(b.path("lib/media"));
+    media.addImport("pw_c", pw_c_translate.createModule());
+    media.addCSourceFile(.{ .file = b.path("lib/media/pw_shim.c"), .flags = &.{"-std=gnu11"} });
+    media.addIncludePath(b.path("lib/media"));
+    media.linkSystemLibrary("libpipewire-0.3", .{});
 
     // ---------------------------------------------------------------------------------
     // Scene graph and client-side decorations.

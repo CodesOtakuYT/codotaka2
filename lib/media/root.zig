@@ -5,3 +5,4 @@ pub const c = @import("av_c");
 pub const HwDevice = @import("HwDevice.zig");
 pub const Decoder = @import("Decoder.zig");
 pub const Frame = @import("Frame.zig");
+pub const Audio = @import("Audio.zig");

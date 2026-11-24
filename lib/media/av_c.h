@@ -4,3 +4,4 @@
 #include <libavutil/hwcontext_vulkan.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/error.h>
+#include <libswresample/swresample.h>

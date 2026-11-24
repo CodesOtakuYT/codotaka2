@@ -10,11 +10,23 @@ const vk = @import("vulkan");
 const c = @import("av_c");
 const HwDevice = @import("HwDevice.zig");
 const Frame = @import("Frame.zig");
+const Audio = @import("Audio.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.media);
 
 pub const queue_depth = 6;
+/// Compressed video packets buffered between demuxing and decoding (cheap; seconds deep),
+/// so a full frame queue never stops the demuxer from feeding audio.
+pub const packet_depth = 512;
+
+/// Demux -> video decode messages.
+const VideoItem = union(enum) {
+    packet: *c.AVPacket,
+    /// End of stream: flush the decoder, then continue with timestamps offset by this
+    /// (looping), or stop.
+    end: ?i64,
+};
 
 pub const Options = struct {
     /// Seek back to the start at end of stream.
@@ -29,10 +41,24 @@ codec: *c.AVCodecContext,
 stream: *c.AVStream,
 opts: Options,
 
+audio: ?AudioTrack = null,
+
 queue: Io.Queue(Frame),
 queue_buf: [queue_depth]Frame = undefined,
-task: ?Io.Future(anyerror!void) = null,
+packets: Io.Queue(VideoItem),
+packets_buf: [packet_depth]VideoItem = undefined,
+demux_task: ?Io.Future(anyerror!void) = null,
+video_task: ?Io.Future(anyerror!void) = null,
 wake_fd: linux.fd_t,
+
+/// The stream's audio: software-decoded, resampled to f32 stereo at the output rate.
+pub const AudioTrack = struct {
+    stream: *c.AVStream,
+    codec: *c.AVCodecContext,
+    swr: *c.SwrContext,
+    ring: Audio.Ring,
+    scratch: []f32,
+};
 
 pub fn open(gpa: Allocator, io: Io, hw: *HwDevice, path: [:0]const u8, opts: Options) !*Decoder {
     var fmt: ?*c.AVFormatContext = null;
@@ -74,11 +100,17 @@ pub fn open(gpa: Allocator, io: Io, hw: *HwDevice, path: [:0]const u8, opts: Opt
         .stream = stream,
         .opts = opts,
         .queue = undefined,
+        .packets = undefined,
         .wake_fd = wake_fd,
     };
     self.queue = .init(&self.queue_buf);
+    self.packets = .init(&self.packets_buf);
     codec.*.@"opaque" = self;
     try HwDevice.check(c.avcodec_open2(codec, codec_info, null), "avcodec_open2");
+    self.audio = openAudio(gpa, self.fmt, index) catch |err| blk: {
+        log.warn("audio disabled: {t}", .{err});
+        break :blk null;
+    };
 
     const par = stream.codecpar.*;
     log.info("{s}: {s} {d}x{d} {s}, {d:.3} fps", .{
@@ -92,23 +124,71 @@ pub fn open(gpa: Allocator, io: Io, hw: *HwDevice, path: [:0]const u8, opts: Opt
     return self;
 }
 
-/// Starts decoding on its own concurrent task.
+/// Starts the demux (+ audio decode) and video decode tasks.
 pub fn start(self: *Decoder) !void {
-    self.task = try self.io.concurrent(run, .{self});
+    self.video_task = try self.io.concurrent(videoLoop, .{self});
+    self.demux_task = try self.io.concurrent(demuxLoop, .{self});
 }
 
+fn openAudio(gpa: Allocator, fmt: *c.AVFormatContext, video_index: c_int) !?AudioTrack {
+    var dec: ?*const c.AVCodec = null;
+    const index = c.av_find_best_stream(fmt, c.AVMEDIA_TYPE_AUDIO, -1, video_index, &dec, 0);
+    if (index < 0) return null;
+    const stream: *c.AVStream = fmt.streams[@intCast(index)];
+    var codec = c.avcodec_alloc_context3(dec) orelse return error.OutOfMemory;
+    errdefer c.avcodec_free_context(@ptrCast(&codec));
+    try HwDevice.check(c.avcodec_parameters_to_context(codec, stream.codecpar), "avcodec_parameters_to_context(audio)");
+    codec.*.pkt_timebase = stream.time_base;
+    try HwDevice.check(c.avcodec_open2(codec, dec, null), "avcodec_open2(audio)");
+
+    var out_layout: c.AVChannelLayout = undefined;
+    c.av_channel_layout_default(&out_layout, Audio.channels);
+    var swr: ?*c.SwrContext = null;
+    try HwDevice.check(c.swr_alloc_set_opts2(&swr, &out_layout, c.AV_SAMPLE_FMT_FLT, Audio.rate, &codec.*.ch_layout, codec.*.sample_fmt, codec.*.sample_rate, 0, null), "swr_alloc_set_opts2");
+    errdefer c.swr_free(&swr);
+    try HwDevice.check(c.swr_init(swr), "swr_init");
+
+    var ring = try Audio.Ring.init(gpa, 2);
+    errdefer ring.deinit(gpa);
+    const scratch = try gpa.alloc(f32, 16384 * Audio.channels);
+    log.info("audio: {s} {d} Hz {d} ch -> f32 {d} Hz stereo", .{ c.avcodec_get_name(codec.*.codec_id), codec.*.sample_rate, codec.*.ch_layout.nb_channels, Audio.rate });
+    return .{ .stream = stream, .codec = codec, .swr = swr.?, .ring = ring, .scratch = scratch };
+}
+
+/// The audio ring to drain (null if the stream has no usable audio).
+pub fn audioRing(self: *Decoder) ?*Audio.Ring {
+    return if (self.audio) |*a| &a.ring else null;
+}
+
+/// Stop the audio output (which reads the ring) before calling this.
 pub fn close(self: *Decoder) void {
-    if (self.task) |*t| {
-        self.queue.close(self.io);
-        _ = t.cancel(self.io) catch {};
-    }
+    self.queue.close(self.io);
+    self.packets.close(self.io);
+    if (self.demux_task) |*t| _ = t.cancel(self.io) catch {};
+    if (self.video_task) |*t| _ = t.cancel(self.io) catch {};
     var buf: [queue_depth]Frame = undefined;
     while (true) {
         const n = self.queue.getUncancelable(self.io, &buf, 0) catch break;
         if (n == 0) break;
         for (buf[0..n]) |*f| f.release();
     }
+    var items: [32]VideoItem = undefined;
+    while (true) {
+        const n = self.packets.getUncancelable(self.io, &items, 0) catch break;
+        if (n == 0) break;
+        for (items[0..n]) |it| if (it == .packet) {
+            var p: ?*c.AVPacket = it.packet;
+            c.av_packet_free(&p);
+        };
+    }
     c.avcodec_free_context(@ptrCast(&self.codec));
+    if (self.audio) |*a| {
+        c.avcodec_free_context(@ptrCast(&a.codec));
+        var swr: ?*c.SwrContext = a.swr;
+        c.swr_free(&swr);
+        a.ring.deinit(self.gpa);
+        self.gpa.free(a.scratch);
+    }
     var fmt: ?*c.AVFormatContext = self.fmt;
     c.avformat_close_input(&fmt);
     _ = linux.close(self.wake_fd);
@@ -127,7 +207,10 @@ pub fn eventFd(self: *const Decoder) linux.fd_t {
     return self.wake_fd;
 }
 
-fn run(self: *Decoder) anyerror!void {
+/// Reads packets: audio is decoded here (into the ring), video packets are queued for
+/// `videoLoop`. Loops the file by seeking back and offsetting timestamps.
+fn demuxLoop(self: *Decoder) anyerror!void {
+    defer self.packets.close(self.io);
     const pkt = c.av_packet_alloc() orelse return error.OutOfMemory;
     defer {
         var p: ?*c.AVPacket = pkt;
@@ -140,26 +223,76 @@ fn run(self: *Decoder) anyerror!void {
     }
 
     var loop_offset_ns: i64 = 0;
-    var last_pts_ns: i64 = 0;
+    var video_end_ns: i64 = 0; // end of the latest video packet in this pass
     while (true) {
         const rc = c.av_read_frame(self.fmt, pkt);
         if (rc == c.AVERROR_EOF) {
-            try HwDevice.check(c.avcodec_send_packet(self.codec, null), "avcodec_send_packet(flush)");
-            try self.drain(frame, loop_offset_ns, &last_pts_ns);
-            if (!self.opts.loop) break;
-            // Restart seamlessly: keep timestamps increasing across loops.
-            loop_offset_ns = last_pts_ns + self.frameDurationNs();
+            if (self.audio) |*a| {
+                _ = c.avcodec_send_packet(a.codec, null);
+                try self.drainAudio(a, frame, loop_offset_ns);
+                c.avcodec_flush_buffers(a.codec);
+            }
+            if (!self.opts.loop) {
+                try self.packets.putOne(self.io, .{ .end = null });
+                return;
+            }
+            // Restart seamlessly: keep timestamps increasing across loops. (Audio keeps
+            // counting samples, so its clock stays continuous too.)
+            loop_offset_ns = video_end_ns;
+            try self.packets.putOne(self.io, .{ .end = loop_offset_ns });
             try HwDevice.check(c.av_seek_frame(self.fmt, self.stream.index, 0, c.AVSEEK_FLAG_BACKWARD), "av_seek_frame");
-            c.avcodec_flush_buffers(self.codec);
             continue;
         }
         try HwDevice.check(rc, "av_read_frame");
         defer c.av_packet_unref(pkt);
-        if (pkt.*.stream_index != self.stream.index) continue;
-        try HwDevice.check(c.avcodec_send_packet(self.codec, pkt), "avcodec_send_packet");
-        try self.drain(frame, loop_offset_ns, &last_pts_ns);
+        if (pkt.*.stream_index == self.stream.index) {
+            if (pkt.*.pts != c.AV_NOPTS_VALUE)
+                video_end_ns = @max(video_end_ns, loop_offset_ns + self.toNs(pkt.*.pts + pkt.*.duration));
+            const owned = c.av_packet_clone(pkt) orelse return error.OutOfMemory;
+            self.packets.putOne(self.io, .{ .packet = owned }) catch |err| {
+                var p: ?*c.AVPacket = owned;
+                c.av_packet_free(&p);
+                return err;
+            };
+        } else if (self.audio) |*a| if (pkt.*.stream_index == a.stream.index) {
+            if (c.avcodec_send_packet(a.codec, pkt) >= 0) try self.drainAudio(a, frame, loop_offset_ns);
+        };
     }
-    self.queue.close(self.io);
+}
+
+/// Decodes queued video packets into the frame queue (Vulkan Video).
+fn videoLoop(self: *Decoder) anyerror!void {
+    defer self.queue.close(self.io);
+    const frame = c.av_frame_alloc() orelse return error.OutOfMemory;
+    defer {
+        var f: ?*c.AVFrame = frame;
+        c.av_frame_free(&f);
+    }
+    var loop_offset_ns: i64 = 0;
+    var last_pts_ns: i64 = 0;
+    while (true) {
+        const item = self.packets.getOne(self.io) catch |err| switch (err) {
+            error.Closed => return,
+            else => return err,
+        };
+        switch (item) {
+            .packet => |pkt| {
+                defer {
+                    var p: ?*c.AVPacket = pkt;
+                    c.av_packet_free(&p);
+                }
+                try HwDevice.check(c.avcodec_send_packet(self.codec, pkt), "avcodec_send_packet");
+                try self.drain(frame, loop_offset_ns, &last_pts_ns);
+            },
+            .end => |next_offset| {
+                try HwDevice.check(c.avcodec_send_packet(self.codec, null), "avcodec_send_packet(flush)");
+                try self.drain(frame, loop_offset_ns, &last_pts_ns);
+                const offset = next_offset orelse return;
+                c.avcodec_flush_buffers(self.codec);
+                loop_offset_ns = offset;
+            },
+        }
+    }
 }
 
 fn drain(self: *Decoder, frame: *c.AVFrame, offset_ns: i64, last_pts_ns: *i64) !void {
@@ -184,6 +317,28 @@ fn drain(self: *Decoder, frame: *c.AVFrame, offset_ns: i64, last_pts_ns: *i64) !
         };
         const one: u64 = 1;
         _ = linux.write(self.wake_fd, std.mem.asBytes(&one).ptr, @sizeOf(u64));
+    }
+}
+
+/// Decodes, resamples and pushes audio into the ring, waiting (cancelably) while it is full.
+fn drainAudio(self: *Decoder, a: *AudioTrack, frame: *c.AVFrame, offset_ns: i64) !void {
+    while (true) {
+        const rc = c.avcodec_receive_frame(a.codec, frame);
+        if (rc == c.AVERROR(c.EAGAIN) or rc == c.AVERROR_EOF) return;
+        if (rc < 0) return; // corrupt audio is skipped, video continues
+        defer c.av_frame_unref(frame);
+        if (frame.pts != c.AV_NOPTS_VALUE)
+            a.ring.setBase(offset_ns + c.av_rescale_q(frame.pts, a.stream.time_base, .{ .num = 1, .den = 1_000_000_000 }));
+        var out: [*c]u8 = @ptrCast(a.scratch.ptr);
+        const max_frames: c_int = @intCast(a.scratch.len / Audio.channels);
+        const n = c.swr_convert(a.swr, &out, max_frames, @ptrCast(frame.extended_data), frame.nb_samples);
+        if (n <= 0) continue;
+        var pending = a.scratch[0 .. @as(usize, @intCast(n)) * Audio.channels];
+        while (pending.len > 0) {
+            const written = a.ring.write(pending);
+            pending = pending[written * Audio.channels ..];
+            if (pending.len > 0) try self.io.sleep(.fromMilliseconds(5), .awake);
+        }
     }
 }
 

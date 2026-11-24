@@ -251,8 +251,15 @@ const App = struct {
                 // Releasing frames can destroy FFmpeg's pool images: let the GPU finish
                 // with them first, then stop decoding, then tear the scene down.
                 e.binding.gpu.device.waitIdle();
+                p.window.stopAudio();
                 p.decoder.close();
-                log.info("player: {d} frames shown, {d} dropped", .{ p.window.stats().shown, p.window.stats().dropped });
+                const st = p.window.stats();
+                log.info("player: {d} frames shown, {d} dropped", .{ st.shown, st.dropped });
+                if (st.sync_samples > 0) log.info("A/V sync vs audio clock: mean |error| {d:.2} ms, max {d:.2} ms over {d} frames", .{
+                    @as(f64, @floatFromInt(@divFloor(st.sync_abs_sum_ns, st.sync_samples))) / 1e6,
+                    @as(f64, @floatFromInt(st.sync_max_abs_ns)) / 1e6,
+                    st.sync_samples,
+                });
                 p.window.destroy();
             },
         }

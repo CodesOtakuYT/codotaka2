@@ -21,7 +21,17 @@ const Decoration = csd.Decoration(Scene);
 pub const Stats = struct {
     shown: u64 = 0,
     dropped: u64 = 0,
-    late_wakes: u64 = 0,
+    /// A/V error of shown frames against the audio clock at their predicted presentation.
+    sync_samples: u64 = 0,
+    sync_abs_sum_ns: i128 = 0,
+    sync_max_abs_ns: i128 = 0,
+
+    fn addSync(s: *Stats, err_ns: i128) void {
+        const a: i128 = @intCast(@abs(err_ns));
+        s.sync_samples += 1;
+        s.sync_abs_sum_ns += a;
+        s.sync_max_abs_ns = @max(s.sync_max_abs_ns, a);
+    }
 };
 
 const lookahead = 2;
@@ -30,11 +40,15 @@ const lookahead = 2;
 const VideoView = struct {
     gpa: Allocator,
     decoder: *media.Decoder,
+    /// Master clock when the stream has audio.
+    audio: ?*media.Audio.Output = null,
     pending: std.ArrayList(media.Frame) = .empty,
     current: ?media.Frame = null,
     /// Monotonic time at which pts 0 is presented (set from the first frame).
     anchor_ns: ?i128 = null,
     paused_at: ?i128 = null,
+    /// Audio clock samples published before this (stale, from before a pause) are ignored.
+    clock_valid_after: i128 = 0,
     stats: Stats = .{},
     dirty: bool = false,
 
@@ -53,7 +67,22 @@ const VideoView = struct {
         if (self.paused_at) |p| {
             if (self.anchor_ns) |*a| a.* += now_ns - p; // resume where we stopped
             self.paused_at = null;
+            self.clock_valid_after = now_ns;
         } else self.paused_at = now_ns;
+        if (self.audio) |a| a.setActive(self.paused_at == null);
+    }
+
+    /// Media time presented at monotonic time `t`: from the audio clock (which already
+    /// includes the audio output latency) when available, else from the local anchor.
+    /// Null while the audio clock has no fresh sample (startup, right after resume): the
+    /// current frame is held instead of extrapolating a stale clock across the pause.
+    fn mediaTimeAt(self: *VideoView, t: i128) ?i128 {
+        if (self.audio) |a| {
+            const sample = a.clock.read() orelse return null;
+            if (sample.heard_ns < self.clock_valid_after) return null;
+            return media.Audio.Clock.mediaTimeAt(sample, t);
+        }
+        return if (self.anchor_ns) |anchor| t - anchor else null;
     }
 
     fn update(ptr: *anyopaque, ft: scene.FrameTime) scene.Update {
@@ -71,7 +100,16 @@ const VideoView = struct {
         }
 
         if (self.anchor_ns == null) self.anchor_ns = ft.target_ns - self.pending.items[0].pts_ns;
-        const media_time = ft.target_ns - self.anchor_ns.?;
+        const media_time = self.mediaTimeAt(ft.target_ns) orelse {
+            // No usable clock yet: show the first frame so the window isn't empty, then
+            // hold until audio publishes a fresh clock sample (within one audio quantum).
+            if (self.current == null) {
+                self.current = self.pending.items[0];
+                _ = self.pending.orderedRemove(0);
+                return .{ .dirty = true, .next_wake_ns = ft.now_ns + std.time.ns_per_ms * 5 };
+            }
+            return .{ .dirty = false, .next_wake_ns = ft.now_ns + std.time.ns_per_ms * 5 };
+        };
         // Newest frame due by the predicted presentation time; older ones are dropped.
         var pick: ?usize = null;
         for (self.pending.items, 0..) |f, i| {
@@ -86,14 +124,15 @@ const VideoView = struct {
             self.current = self.pending.items[p];
             self.pending.replaceRange(self.gpa, 0, p + 1, &.{}) catch unreachable;
             self.stats.shown += 1;
+            if (self.audio != null and ft.refresh_ns != 0) self.stats.addSync(self.current.?.pts_ns - media_time);
             dirty = true;
         }
-        // Wake when the next frame becomes due at the predicted vsync; if none is decoded yet,
-        // the decoder's eventfd wakes us.
-        const next: ?i128 = if (self.pending.items.len > 0)
-            ft.wakeToPresentAt(self.anchor_ns.? + self.pending.items[0].pts_ns - @divFloor(@as(i128, ft.refresh_ns), 2))
-        else
-            null;
+        // Wake when the next frame becomes due at the predicted vsync (converted from media
+        // time to monotonic time); if none is decoded yet, the decoder's eventfd wakes us.
+        const next: ?i128 = if (self.pending.items.len > 0) blk: {
+            const due_media = self.pending.items[0].pts_ns - @divFloor(@as(i128, ft.refresh_ns), 2);
+            break :blk ft.wakeToPresentAt(ft.target_ns + (due_media - media_time));
+        } else null;
         return .{ .dirty = dirty, .next_wake_ns = next };
     }
 
@@ -137,12 +176,24 @@ pub const Window = struct {
         }, fonts, title);
         errdefer decoration.destroy();
         self.* = .{ .gpa = gpa, .sw = undefined, .decoration = decoration, .video = .{ .gpa = gpa, .decoder = decoder } };
+        if (decoder.audioRing()) |ring| self.video.audio = media.Audio.Output.create(gpa, ring, "codotaka") catch |err| blk: {
+            log.warn("no audio output: {t}", .{err});
+            break :blk null;
+        };
+        errdefer self.stopAudio();
         self.sw = try sw_create.call(.{ .ctx = self, .layout = layout, .pointer = pointer, .key = key });
         decoration.attach(self.sw);
         return self;
     }
 
+    /// Stops the realtime audio thread (it reads the decoder's ring).
+    pub fn stopAudio(self: *Window) void {
+        if (self.video.audio) |a| a.destroy();
+        self.video.audio = null;
+    }
+
     pub fn destroy(self: *Window) void {
+        self.stopAudio();
         self.decoration.destroy();
         self.sw.destroy();
         self.video.deinit();
