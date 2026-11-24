@@ -33,6 +33,11 @@ pub const Recorder = struct {
     /// Called once per frame before any target, after heaps could be bound.
     begin_frame: *const fn (ctx: *anyopaque, cmd: vk.CommandBufferProxy) anyerror!void,
     record: *const fn (ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.Linear, target: Target, views: []const frame.View) anyerror!void,
+    /// Called after all targets: add semaphores the frame's single submit must wait on
+    /// or signal (e.g. timelines of frames decoded by FFmpeg).
+    end_frame: *const fn (ctx: *anyopaque, sync: *vk_core.FrameRing.Sync) anyerror!void,
+    /// Called once the submit is queued (or abandoned), e.g. to release locks.
+    submitted: *const fn (ctx: *anyopaque) void,
 
     pub const Target = struct {
         view: vk.ImageView,
@@ -194,13 +199,16 @@ pub fn renderFrame(self: *Presenter, arena: Allocator, trees: []const TreeWork, 
             return;
         };
         const cmd = f.commands(self.device);
+        defer recorder.submitted(recorder.ctx);
         try recorder.begin_frame(recorder.ctx, cmd);
         for (slots.items) |slot| {
             const target = slot.target.begin(cmd, slot.buffer);
             try recorder.record(recorder.ctx, cmd, &f.upload, target, slot.work.views);
             slot.target.end(cmd, slot.buffer);
         }
-        const value = try self.ring.submit(f);
+        var sync: vk_core.FrameRing.Sync = .{};
+        try recorder.end_frame(recorder.ctx, &sync);
+        const value = try self.ring.submit(f, &sync);
         try self.stageFence(f.done);
         for (slots.items) |slot| try slot.target.attach(slot.buffer, value, slot.work.damage);
     }

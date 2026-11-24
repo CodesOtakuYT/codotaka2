@@ -125,10 +125,17 @@ pub fn flush(self: *Display) void {
     _ = c.wl_display_flush(self.display);
 }
 
+pub const WaitResult = struct {
+    wayland: bool = false,
+    /// Bit i set if extra_fds[i] became readable (first 64).
+    ready: u64 = 0,
+    timed_out: bool = false,
+};
+
 /// Reads and dispatches Wayland events. With `timeout_ms == 0` this never blocks;
 /// otherwise it sleeps until Wayland traffic arrives, one of `extra_fds` becomes
 /// readable, or the timeout expires (-1 = forever).
-pub fn wait(self: *Display, extra_fds: []const linux.fd_t, timeout_ms: i32) !void {
+pub fn wait(self: *Display, extra_fds: []const linux.fd_t, timeout_ms: i32) !WaitResult {
     while (c.wl_display_prepare_read(self.display) != 0) {
         if (c.wl_display_dispatch_pending(self.display) < 0) return error.WaylandDispatch;
     }
@@ -140,12 +147,18 @@ pub fn wait(self: *Display, extra_fds: []const linux.fd_t, timeout_ms: i32) !voi
     for (extra_fds[0 .. n - 1], fds_buf[1..n]) |fd, *p| p.* = .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 };
 
     const rc = linux.poll(&fds_buf, n, timeout_ms);
+    var result: WaitResult = .{ .timed_out = linux.errno(rc) == .SUCCESS and rc == 0 };
     if (linux.errno(rc) == .SUCCESS and rc > 0 and fds_buf[0].revents & linux.POLL.IN != 0) {
+        result.wayland = true;
         if (c.wl_display_read_events(self.display) < 0) return error.WaylandRead;
     } else {
         c.wl_display_cancel_read(self.display);
     }
+    for (fds_buf[1..n], 0..) |p, i| if (p.revents != 0 and i < 64) {
+        result.ready |= @as(u64, 1) << @intCast(i);
+    };
     if (c.wl_display_dispatch_pending(self.display) < 0) return error.WaylandDispatch;
+    return result;
 }
 
 /// The compositor-side image description for `mode`, created once and cached.

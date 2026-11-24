@@ -28,6 +28,12 @@ pub const baseline_extensions = [_][*:0]const u8{
     vk.device_extensions.khr_robustness_2.name,
 };
 
+pub const QueueFamily = struct {
+    index: u32,
+    flags: vk.QueueFlags,
+    video_ops: vk.VideoCodecOperationFlagsKHR = .{},
+};
+
 gpa: Allocator,
 instance: *Instance,
 pdev: vk.PhysicalDevice,
@@ -38,6 +44,13 @@ vkd: vk.DeviceWrapper,
 proxy: vk.DeviceProxy,
 /// Internally synchronized: any thread may submit.
 queue: vk.QueueProxy,
+/// Families with a created queue (graphics first), e.g. for handing to FFmpeg.
+queue_families: []QueueFamily,
+/// Video decode family, if requested and available.
+decode_family: ?QueueFamily = null,
+/// Everything enabled at creation, kept alive for interop (FFmpeg wants both).
+enabled_extensions: [][*:0]const u8,
+features: *Features,
 memory: Memory,
 deletion: DeletionQueue = .{},
 
@@ -49,10 +62,20 @@ timeline_value: std.atomic.Value(u64) = .init(0),
 pub const Options = struct {
     /// Extensions beyond `baseline_extensions`.
     extensions: []const [*:0]const u8 = &.{},
+    /// Also create a video-decode queue and enable Vulkan Video decode for every codec the
+    /// device supports (H.264, H.265, AV1, VP9).
+    video_decode: bool = false,
+};
+
+const video_codec_extensions = .{
+    .{ "decode_h264_khr", vk.device_extensions.khr_video_decode_h_264.name },
+    .{ "decode_h265_khr", vk.device_extensions.khr_video_decode_h_265.name },
+    .{ "decode_av1_khr", vk.device_extensions.khr_video_decode_av_1.name },
+    .{ "decode_vp9_khr", vk.device_extensions.khr_video_decode_vp_9.name },
 };
 
 /// The feature chain for the baseline; used both to query and to enable.
-const Features = struct {
+pub const Features = struct {
     core: vk.PhysicalDeviceFeatures2 = .{ .features = .{} },
     f11: vk.PhysicalDeviceVulkan11Features = .{},
     f12: vk.PhysicalDeviceVulkan12Features = .{},
@@ -64,6 +87,10 @@ const Features = struct {
     unified: vk.PhysicalDeviceUnifiedImageLayoutsFeaturesKHR = .{},
     sync_queues: vk.PhysicalDeviceInternallySynchronizedQueuesFeaturesKHR = .{},
     robustness2: vk.PhysicalDeviceRobustness2FeaturesKHR = .{},
+    /// Only linked when video decode is enabled.
+    video_maintenance1: vk.PhysicalDeviceVideoMaintenance1FeaturesKHR = .{},
+    /// Only linked when VP9 decode is supported.
+    video_vp9: vk.PhysicalDeviceVideoDecodeVP9FeaturesKHR = .{},
 
     /// Links the chain; returns the PhysicalDeviceFeatures2 head.
     fn link(f: *Features) *vk.PhysicalDeviceFeatures2 {
@@ -132,26 +159,80 @@ pub fn supportsBaseline(instance: *Instance, pdev: vk.PhysicalDevice) bool {
     return true;
 }
 
+/// The first queue family that can decode video, with the codecs it supports.
+pub fn findDecodeFamily(instance: *Instance, gpa: Allocator, pdev: vk.PhysicalDevice) !?QueueFamily {
+    var count: u32 = 0;
+    instance.proxy.getPhysicalDeviceQueueFamilyProperties2(pdev, &count, null);
+    const props = try gpa.alloc(vk.QueueFamilyProperties2, count);
+    defer gpa.free(props);
+    const video = try gpa.alloc(vk.QueueFamilyVideoPropertiesKHR, count);
+    defer gpa.free(video);
+    for (props, video) |*p, *v| {
+        v.* = .{ .video_codec_operations = .{} };
+        p.* = .{ .p_next = v, .queue_family_properties = undefined };
+    }
+    instance.proxy.getPhysicalDeviceQueueFamilyProperties2(pdev, &count, props.ptr);
+    for (props, video, 0..) |p, v, i| {
+        if (p.queue_family_properties.queue_flags.video_decode_khr and v.video_codec_operations.toInt() != 0)
+            return .{ .index = @intCast(i), .flags = p.queue_family_properties.queue_flags, .video_ops = v.video_codec_operations };
+    }
+    return null;
+}
+
 pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate, opts: Options) !*Device {
     const self = try gpa.create(Device);
     errdefer gpa.destroy(self);
 
-    const extensions = try std.mem.concat(gpa, [*:0]const u8, &.{ &baseline_extensions, opts.extensions });
-    defer gpa.free(extensions);
+    var extensions: std.ArrayList([*:0]const u8) = .empty;
+    errdefer extensions.deinit(gpa);
+    try extensions.appendSlice(gpa, &baseline_extensions);
+    try extensions.appendSlice(gpa, opts.extensions);
 
-    var features = Features.required();
+    const features = try gpa.create(Features);
+    errdefer gpa.destroy(features);
+    features.* = Features.required();
+    const head = features.link();
+
+    var families: std.ArrayList(QueueFamily) = .empty;
+    errdefer families.deinit(gpa);
+    try families.append(gpa, .{ .index = candidate.queue_family, .flags = .{ .graphics = true, .compute = true, .transfer = true } });
+
+    var decode: ?QueueFamily = null;
+    if (opts.video_decode) {
+        if (try findDecodeFamily(instance, gpa, candidate.pdev)) |fam| {
+            decode = fam;
+            try families.append(gpa, fam);
+            try extensions.appendSlice(gpa, &.{
+                vk.device_extensions.khr_video_queue.name,
+                vk.device_extensions.khr_video_decode_queue.name,
+                vk.device_extensions.khr_video_maintenance_1.name,
+            });
+            inline for (video_codec_extensions) |e| if (@field(fam.video_ops, e[0])) try extensions.append(gpa, e[1]);
+            features.f11.sampler_ycbcr_conversion = .true;
+            features.video_maintenance1 = .{ .video_maintenance_1 = .true };
+            features.robustness2.p_next = &features.video_maintenance1;
+            // VP9 decode is gated by a feature in addition to its extension.
+            if (fam.video_ops.decode_vp9_khr) {
+                features.video_vp9 = .{ .video_decode_vp9 = .true };
+                features.video_maintenance1.p_next = &features.video_vp9;
+            }
+        } else log.warn("no video decode queue on {s}", .{std.mem.sliceTo(&candidate.props.device_name, 0)});
+    }
+
     const priority = [_]f32{1.0};
+    var queue_infos: [2]vk.DeviceQueueCreateInfo = undefined;
+    for (families.items, 0..) |fam, i| queue_infos[i] = .{
+        .flags = .{ .internally_synchronized_khr = true },
+        .queue_family_index = fam.index,
+        .queue_count = 1,
+        .p_queue_priorities = &priority,
+    };
     const handle = try instance.proxy.createDevice(candidate.pdev, &.{
-        .p_next = features.link(),
-        .queue_create_info_count = 1,
-        .p_queue_create_infos = &.{.{
-            .flags = .{ .internally_synchronized_khr = true },
-            .queue_family_index = candidate.queue_family,
-            .queue_count = 1,
-            .p_queue_priorities = &priority,
-        }},
-        .enabled_extension_count = @intCast(extensions.len),
-        .pp_enabled_extension_names = extensions.ptr,
+        .p_next = head,
+        .queue_create_info_count = @intCast(families.items.len),
+        .p_queue_create_infos = &queue_infos,
+        .enabled_extension_count = @intCast(extensions.items.len),
+        .pp_enabled_extension_names = extensions.items.ptr,
     }, null);
 
     var heap_props: vk.PhysicalDeviceDescriptorHeapPropertiesEXT = undefined;
@@ -170,6 +251,10 @@ pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate
         .vkd = vk.DeviceWrapper.load(handle, instance.vki.dispatch.vkGetDeviceProcAddr.?),
         .proxy = undefined,
         .queue = undefined,
+        .queue_families = try families.toOwnedSlice(gpa),
+        .decode_family = decode,
+        .enabled_extensions = try extensions.toOwnedSlice(gpa),
+        .features = features,
         .memory = .init(instance.proxy, candidate.pdev),
     };
     self.proxy = vk.DeviceProxy.init(handle, &self.vkd);
@@ -194,6 +279,9 @@ pub fn destroy(self: *Device) void {
     self.deletion.deinit(self.gpa);
     self.proxy.destroySemaphore(self.timeline, null);
     self.proxy.destroyDevice(null);
+    self.gpa.free(self.queue_families);
+    self.gpa.free(self.enabled_extensions);
+    self.gpa.destroy(self.features);
     self.gpa.destroy(self);
 }
 

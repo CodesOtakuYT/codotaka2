@@ -85,13 +85,18 @@ pub fn deinit(self: *DescriptorHeaps) void {
 
 /// Writes a sampled-image descriptor for `image` (in GENERAL) and returns its slot.
 pub fn addImage(self: *DescriptorHeaps, image: *const Image) !ImageSlot {
+    return self.addImageView(image.viewInfo());
+}
+
+/// Writes a sampled-image descriptor for any view description (e.g. one plane of a
+/// multi-planar image, created by another library) and returns its slot.
+pub fn addImageView(self: *DescriptorHeaps, view: vk.ImageViewCreateInfo) !ImageSlot {
     const index = self.image_free.pop() orelse blk: {
         if (self.image_next == self.image_capacity) return error.DescriptorHeapFull;
         self.image_next += 1;
         break :blk self.image_next - 1;
     };
     errdefer self.image_free.append(self.gpa, index) catch {};
-    const view = image.viewInfo();
     const info: vk.ImageDescriptorInfoEXT = .{ .p_view = &view, .layout = .general };
     const stride = self.props.image_descriptor_size;
     try self.device.proxy.writeResourceDescriptorsEXT(&.{.{

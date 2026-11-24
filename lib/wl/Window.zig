@@ -151,6 +151,9 @@ pub fn resize(self: *Window, serial: u32, edge: wl.ResizeEdge) void {
 pub fn toggleMaximized(self: *Window) void {
     if (self.maximized) c.xdg_toplevel_unset_maximized(self.toplevel) else c.xdg_toplevel_set_maximized(self.toplevel);
 }
+pub fn toggleFullscreen(self: *Window) void {
+    if (self.fullscreen) c.xdg_toplevel_unset_fullscreen(self.toplevel) else c.xdg_toplevel_set_fullscreen(self.toplevel, null);
+}
 pub fn minimize(self: *Window) void {
     c.xdg_toplevel_set_minimized(self.toplevel);
 }

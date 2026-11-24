@@ -13,6 +13,8 @@ vkb: vk.BaseWrapper,
 vki: vk.InstanceWrapper,
 proxy: vk.InstanceProxy,
 messenger: vk.DebugUtilsMessengerEXT = .null,
+/// Everything enabled at creation (for interop, e.g. FFmpeg).
+enabled_extensions: [][*:0]const u8 = &.{},
 
 pub const api_version = vk.API_VERSION_1_4;
 const validation_layer = "VK_LAYER_KHRONOS_validation";
@@ -24,6 +26,15 @@ pub const Options = struct {
     /// Enable VK_LAYER_KHRONOS_validation if installed.
     validation: bool = false,
     extensions: []const [*:0]const u8 = &.{},
+    /// Validation messages caused by other libraries we can't fix here: reported once
+    /// with the reason, then counted instead of repeated.
+    known_issues: []const KnownIssue = &.{},
+};
+
+pub const KnownIssue = struct {
+    vuid: []const u8,
+    reason: []const u8,
+    seen: std.atomic.Value(u32) = .init(0),
 };
 
 pub const Candidate = struct {
@@ -31,6 +42,8 @@ pub const Candidate = struct {
     queue_family: u32,
     props: vk.PhysicalDeviceProperties,
 };
+
+pub const getProcAddr = vkGetInstanceProcAddr;
 
 pub fn create(gpa: Allocator, opts: Options) !*Instance {
     const self = try gpa.create(Instance);
@@ -60,7 +73,9 @@ pub fn create(gpa: Allocator, opts: Options) !*Instance {
         .message_severity = .{ .warning_ext = true, .error_ext = true },
         .message_type = .{ .general_ext = true, .validation_ext = true, .performance_ext = true },
         .pfn_user_callback = &debugCallback,
+        .p_user_data = @constCast(@ptrCast(opts.known_issues.ptr)),
     };
+    known_issue_count = opts.known_issues.len;
 
     const handle = try self.vkb.createInstance(&.{
         .p_next = if (use_validation) &messenger_info else null,
@@ -78,6 +93,7 @@ pub fn create(gpa: Allocator, opts: Options) !*Instance {
     self.vki = vk.InstanceWrapper.load(handle, self.vkb.dispatch.vkGetInstanceProcAddr.?);
     self.proxy = vk.InstanceProxy.init(handle, &self.vki);
     self.messenger = .null;
+    self.enabled_extensions = try extensions.toOwnedSlice(gpa);
     if (use_validation) {
         var info = messenger_info;
         info.p_next = null;
@@ -87,21 +103,39 @@ pub fn create(gpa: Allocator, opts: Options) !*Instance {
     return self;
 }
 
+/// Total occurrences of each known issue (for a summary at exit).
+pub fn reportKnownIssues(issues: []const KnownIssue) void {
+    for (issues) |*k| {
+        const n = k.seen.load(.monotonic);
+        if (n > 0) validation_log.warn("{s}: {d} occurrences ({s})", .{ k.vuid, n, k.reason });
+    }
+}
+
 pub fn destroy(self: *Instance) void {
     if (self.messenger != .null) self.proxy.destroyDebugUtilsMessengerEXT(self.messenger, null);
     self.proxy.destroyInstance(null);
+    self.gpa.free(self.enabled_extensions);
     self.gpa.destroy(self);
 }
 
 const validation_log = std.log.scoped(.vk_validation);
+var known_issue_count: usize = 0;
 
 fn debugCallback(
     severity: vk.DebugUtilsMessageSeverityFlagsEXT,
     _: vk.DebugUtilsMessageTypeFlagsEXT,
     data: ?*const vk.DebugUtilsMessengerCallbackDataEXT,
-    _: ?*anyopaque,
+    user: ?*anyopaque,
 ) callconv(vk.vulkan_call_conv) vk.Bool32 {
     const msg: [*:0]const u8 = if (data) |d| d.p_message orelse "?" else "?";
+    if (user) |u| if (data) |d| if (d.p_message_id_name) |id_c| {
+        const id = std.mem.span(id_c);
+        const issues = @as([*]KnownIssue, @ptrCast(@alignCast(u)))[0..known_issue_count];
+        for (issues) |*k| if (std.mem.eql(u8, k.vuid, id)) {
+            if (k.seen.fetchAdd(1, .monotonic) == 0) validation_log.warn("known issue {s} ({s}); further occurrences counted", .{ k.vuid, k.reason });
+            return .false;
+        };
+    };
     if (severity.error_ext) validation_log.err("{s}", .{msg}) else validation_log.warn("{s}", .{msg});
     return .false;
 }

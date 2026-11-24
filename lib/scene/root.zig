@@ -27,7 +27,29 @@ pub const FrameTime = struct {
     /// Predicted presentation time of the frame being planned (from wp_presentation).
     target_ns: i128,
     refresh_ns: u32,
+
+    /// When to wake so that the predicted presentation time is >= `t`. Presentation times
+    /// move on the vsync grid, so waking at `t - refresh` can be too early (and then the
+    /// deadline is in the past while the content is not due yet: a busy loop).
+    pub fn wakeToPresentAt(ft: FrameTime, t: i128) i128 {
+        if (ft.refresh_ns == 0) return t;
+        const r: i128 = ft.refresh_ns;
+        if (t <= ft.target_ns) return ft.now_ns; // due already
+        // The first vsync at or after t (on the grid through target_ns) becomes the
+        // predicted target exactly one refresh before it.
+        const steps = std.math.divCeil(i128, t - ft.target_ns, r) catch unreachable;
+        return ft.target_ns + steps * r - r;
+    }
 };
+
+test "wakeToPresentAt snaps to the vsync grid" {
+    // 10 ms refresh; now = 1, next predicted vsync at 10.
+    const ft: FrameTime = .{ .now_ns = 1, .target_ns = 10, .refresh_ns = 10 };
+    try std.testing.expectEqual(@as(i128, 1), ft.wakeToPresentAt(10)); // due at this vsync
+    try std.testing.expectEqual(@as(i128, 10), ft.wakeToPresentAt(15)); // vsync 20 is predicted from t=10
+    try std.testing.expectEqual(@as(i128, 10), ft.wakeToPresentAt(20));
+    try std.testing.expectEqual(@as(i128, 20), ft.wakeToPresentAt(21));
+}
 
 pub const Update = struct {
     dirty: bool = false,
@@ -340,7 +362,12 @@ pub fn Scene(comptime Target: type) type {
                     if (u.dirty) v.dirty = true;
                     if (u.next_wake_ns) |t| self.next_wake_ns = if (self.next_wake_ns) |cur| @min(cur, t) else t;
                 }
-                if (!self.window.frame_ready) return null;
+                // Waiting for the compositor's frame callback: it wakes us; content deadlines
+                // that already passed must not turn the event loop into a busy wait.
+                if (!self.window.frame_ready) {
+                    self.next_wake_ns = null;
+                    return null;
+                }
 
                 const scale = self.window.scale;
                 var work: std.ArrayList(TargetWork) = .empty;

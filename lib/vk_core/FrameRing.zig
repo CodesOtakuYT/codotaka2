@@ -95,21 +95,42 @@ pub fn begin(self: *FrameRing, completed_value: u64) !?*Frame {
     return f;
 }
 
+/// Extra semaphores for a frame's submission (e.g. other libraries' timelines).
+pub const Sync = struct {
+    pub const max = 32;
+    waits: [max]vk.SemaphoreSubmitInfo = undefined,
+    wait_count: u32 = 0,
+    signals: [max]vk.SemaphoreSubmitInfo = undefined,
+    signal_count: u32 = 0,
+
+    pub fn wait(s: *Sync, semaphore: vk.Semaphore, value: u64, stage: vk.PipelineStageFlags2) !void {
+        if (s.wait_count == max) return error.TooManySemaphores;
+        s.waits[s.wait_count] = .{ .semaphore = semaphore, .value = value, .stage_mask = stage, .device_index = 0 };
+        s.wait_count += 1;
+    }
+
+    pub fn signal(s: *Sync, semaphore: vk.Semaphore, value: u64) !void {
+        if (s.signal_count + 2 >= max) return error.TooManySemaphores;
+        s.signals[s.signal_count] = .{ .semaphore = semaphore, .value = value, .stage_mask = .{ .all_commands = true }, .device_index = 0 };
+        s.signal_count += 1;
+    }
+};
+
 /// Ends and submits `f` (from `begin`), signalling its `done` semaphore and the device
-/// timeline. Returns the timeline value that marks its completion.
-pub fn submit(self: *FrameRing, f: *Frame) !u64 {
+/// timeline plus anything in `extra`. Returns the timeline value marking its completion.
+pub fn submit(self: *FrameRing, f: *Frame, extra: *Sync) !u64 {
     const device = self.device;
     try f.commands(device).endCommandBuffer();
     f.value = device.nextValue();
-    const signals = [_]vk.SemaphoreSubmitInfo{
-        .{ .semaphore = f.done, .value = 0, .stage_mask = .{ .all_commands = true }, .device_index = 0 },
-        .{ .semaphore = device.timeline, .value = f.value, .stage_mask = .{ .all_commands = true }, .device_index = 0 },
-    };
+    try extra.signal(f.done, 0);
+    try extra.signal(device.timeline, f.value);
     try device.queue.submit2(&.{.{
+        .wait_semaphore_info_count = extra.wait_count,
+        .p_wait_semaphore_infos = &extra.waits,
         .command_buffer_info_count = 1,
         .p_command_buffer_infos = &.{.{ .command_buffer = f.cmd, .device_mask = 0 }},
-        .signal_semaphore_info_count = signals.len,
-        .p_signal_semaphore_infos = &signals,
+        .signal_semaphore_info_count = extra.signal_count,
+        .p_signal_semaphore_infos = &extra.signals,
     }}, .null);
     self.index = (self.index + 1) % frames_in_flight;
     return f.value;

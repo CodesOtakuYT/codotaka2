@@ -123,6 +123,28 @@ pub fn build(b: *std.Build) void {
     text.linkLibrary(sheenbidi);
 
     // ---------------------------------------------------------------------------------
+    // Media: FFmpeg demux + Vulkan Video decode on our VkDevice.
+    const av_c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("lib/media/av_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const av_libs = [_][]const u8{ "libavformat", "libavcodec", "libavutil" };
+    for (av_libs) |lib| av_c_translate.linkSystemLibrary(lib, .{});
+    const media = b.addModule("media", .{
+        .root_source_file = b.path("lib/media/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "av_c", .module = av_c_translate.createModule() },
+            .{ .name = "vulkan", .module = vulkan },
+            .{ .name = "vk_core", .module = vk_core },
+        },
+    });
+    for (av_libs) |lib| media.linkSystemLibrary(lib, .{});
+
+    // ---------------------------------------------------------------------------------
     // Scene graph and client-side decorations.
     const scene = b.addModule("scene", .{
         .root_source_file = b.path("lib/scene/root.zig"),
@@ -164,6 +186,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "scene", .module = scene },
             .{ .name = "csd", .module = csd },
             .{ .name = "text", .module = text },
+            .{ .name = "media", .module = media },
         },
     });
 
@@ -172,6 +195,8 @@ pub fn build(b: *std.Build) void {
         "shaders/triangle.frag",
         "shaders/text.vert",
         "shaders/text.frag",
+        "shaders/video.vert",
+        "shaders/video.frag",
         "lib/csd/shaders/decoration.vert",
         "lib/csd/shaders/decoration.frag",
     };
@@ -193,7 +218,7 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the demo").dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run library unit tests");
-    for ([_]*std.Build.Module{ geom, slot_map, drm_sync, dmabuf_feedback }) |m| {
+    for ([_]*std.Build.Module{ geom, slot_map, drm_sync, dmabuf_feedback, scene }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 }
