@@ -21,6 +21,9 @@ pub const Options = struct {
     host_visible: bool = false,
     /// Prefer device-local memory even when host-visible (ReBAR).
     prefer_device_local: bool = true,
+    /// GPU -> CPU readback: host-visible *cached* memory (CPU reads of uncached or
+    /// device-local memory are very slow).
+    readback: bool = false,
 };
 
 pub fn create(device: *Device, opts: Options) !Buffer {
@@ -36,12 +39,14 @@ pub fn create(device: *Device, opts: Options) !Buffer {
     const reqs = dev.getBufferMemoryRequirements(self.buffer);
     const device_address = opts.usage.shader_device_address;
     self.memory = try mem.allocate(dev, &device.memory, reqs, .{
-        .required = if (opts.host_visible) .{ .host_visible = true, .host_coherent = true } else .{ .device_local = true },
-        .preferred = if (opts.prefer_device_local) .{ .device_local = true } else .{},
+        .required = if (opts.readback)
+            .{ .host_visible = true, .host_cached = true }
+        else if (opts.host_visible) .{ .host_visible = true, .host_coherent = true } else .{ .device_local = true },
+        .preferred = if (opts.readback) .{ .host_coherent = true } else if (opts.prefer_device_local) .{ .device_local = true } else .{},
         .device_address = device_address,
     });
     try dev.bindBufferMemory(self.buffer, self.memory, 0);
-    if (opts.host_visible) self.mapped = @ptrCast(try dev.mapMemory(self.memory, 0, vk.WHOLE_SIZE, .{}));
+    if (opts.host_visible or opts.readback) self.mapped = @ptrCast(try dev.mapMemory(self.memory, 0, vk.WHOLE_SIZE, .{}));
     if (device_address) self.address = dev.getBufferDeviceAddress(&.{ .buffer = self.buffer });
     return self;
 }

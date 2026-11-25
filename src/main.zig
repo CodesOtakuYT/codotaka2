@@ -13,6 +13,7 @@ const metrics = @import("metrics.zig");
 const demo = @import("demo.zig");
 const player = @import("player.zig");
 const media = @import("media");
+const eval = @import("eval.zig");
 
 // Let vulkan-zig use the real libwayland types for its platform structs.
 pub const wl_display = wl.c.wl_display;
@@ -41,6 +42,8 @@ var known_issues = [_]vk_core.Instance.KnownIssue{
 const usage =
     \\Usage: codotaka [--hdr] [window-count]      demo windows
     \\       codotaka [--hdr] <video-file>        video player (Vulkan Video, zero copy)
+    \\       codotaka --eval <video> [--step N] [--intervals N] [--start S]
+    \\                                            offline interpolation quality (PSNR vs. dropped frames)
     \\  --hdr   render FP16 scRGB and tag surfaces with the Windows-scRGB image description
     \\Player keys: space pause, f fullscreen, q/Esc quit.
     \\Middle-click the top-left view to promote/demote it to its own subsurface.
@@ -53,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     var video: ?[:0]const u8 = null;
     var color: wl.ColorMode = .sdr;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 2 and std.mem.eql(u8, args[1], "--eval")) return runEval(init, args[2..]);
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--hdr")) {
             color = .hdr_scrgb;
@@ -69,6 +73,29 @@ pub fn main(init: std.process.Init) !void {
     var app = try App.init(init.gpa, init.io, if (video) |v| .{ .player = v } else .{ .demo = window_count }, color);
     defer app.deinit();
     try app.run();
+}
+
+fn runEval(init: std.process.Init, args: []const [:0]const u8) !void {
+    var opts: eval.Options = .{ .path = args[0] };
+    var i: usize = 1;
+    while (i + 1 < args.len) : (i += 2) {
+        const v = args[i + 1];
+        if (std.mem.eql(u8, args[i], "--step")) {
+            opts.step = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, args[i], "--intervals")) {
+            opts.intervals = try std.fmt.parseInt(u32, v, 10);
+        } else if (std.mem.eql(u8, args[i], "--start")) {
+            opts.start_s = try std.fmt.parseFloat(f64, v);
+        } else return error.UnknownEvalOption;
+    }
+    const gpa = init.gpa;
+    const instance = try vk_core.Instance.create(gpa, .{ .app_name = "codotaka-eval", .validation = builtin.mode == .debug, .known_issues = &known_issues });
+    defer instance.destroy();
+    const candidates = try instance.findCandidates(gpa, &vk_present.device_extensions, {}, vk_present.acceptDevice);
+    defer gpa.free(candidates);
+    if (candidates.len == 0) return error.NoVulkanDevice;
+    try eval.run(gpa, init.io, instance, candidates[0], opts);
+    vk_core.Instance.reportKnownIssues(&known_issues);
 }
 
 const Scene = demo.Scene;

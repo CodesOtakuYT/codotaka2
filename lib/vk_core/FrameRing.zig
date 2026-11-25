@@ -28,12 +28,16 @@ device: *Device,
 pool: vk.CommandPool,
 frames: [frames_in_flight]Frame,
 index: usize = 0,
+signal_done: bool = true,
 
 pub const Options = struct {
     /// Make `Frame.done` exportable as a sync_file.
     export_sync_fd: bool = false,
     /// Size of each frame's transient upload buffer.
     upload_size: u64 = 4 << 20,
+    /// Signal each frame's binary `done` semaphore (consumed by presentation); offscreen
+    /// users only need the device timeline.
+    signal_done: bool = true,
 };
 
 pub fn init(device: *Device, opts: Options) !FrameRing {
@@ -51,7 +55,7 @@ pub fn init(device: *Device, opts: Options) !FrameRing {
         .command_buffer_count = frames_in_flight,
     }, &cmds);
 
-    var self: FrameRing = .{ .device = device, .pool = pool, .frames = undefined };
+    var self: FrameRing = .{ .device = device, .pool = pool, .frames = undefined, .signal_done = opts.signal_done };
     var created: usize = 0;
     errdefer for (self.frames[0..created]) |*f| destroyFrame(device, f);
     const export_info: vk.ExportSemaphoreCreateInfo = .{ .handle_types = .{ .sync_fd = true } };
@@ -122,7 +126,7 @@ pub fn submit(self: *FrameRing, f: *Frame, extra: *Sync) !u64 {
     const device = self.device;
     try f.commands(device).endCommandBuffer();
     f.value = device.nextValue();
-    try extra.signal(f.done, 0);
+    if (self.signal_done) try extra.signal(f.done, 0);
     try extra.signal(device.timeline, f.value);
     try device.queue.submit2(&.{.{
         .wait_semaphore_info_count = extra.wait_count,

@@ -33,6 +33,10 @@ const VideoItem = union(enum) {
 pub const Options = struct {
     /// Seek back to the start at end of stream.
     loop: bool = true,
+    /// Decoded frames the caller may hold at once beyond the decoder's own needs.
+    extra_frames: u32 = 0,
+    /// Decode audio (into `audioRing`, which someone must drain, or demuxing stalls).
+    audio: bool = true,
 };
 
 gpa: Allocator,
@@ -123,8 +127,9 @@ pub fn open(gpa: Allocator, io: Io, hw: *HwDevice, path: [:0]const u8, opts: Opt
     self.packets = .init(&self.packets_buf);
     if (self.fmt.duration != c.AV_NOPTS_VALUE) self.duration_ns = self.fmt.duration * (std.time.ns_per_s / c.AV_TIME_BASE);
     codec.*.@"opaque" = self;
+    codec.*.extra_hw_frames = @intCast(opts.extra_frames);
     try HwDevice.check(c.avcodec_open2(codec, codec_info, null), "avcodec_open2");
-    self.audio = openAudio(gpa, self.fmt, index) catch |err| blk: {
+    if (opts.audio) self.audio = openAudio(gpa, self.fmt, index) catch |err| blk: {
         log.warn("audio disabled: {t}", .{err});
         break :blk null;
     };
