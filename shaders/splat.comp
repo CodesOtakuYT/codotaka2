@@ -54,8 +54,8 @@ void main() {
 
     // Importance z: brightness constancy along the vector, forward-backward consistency,
     // and motion that stands out from the camera motion (likely foreground).
-    float z = -12.0 * colorDiff(own, other) - 1.0 * min(length(v + back), 8.0)
-            + 0.15 * min(length(v - camera), 20.0);
+    float z = -pc.splat_z.x * colorDiff(own, other) - pc.splat_z.y * min(length(v + back), 8.0)
+            + pc.splat_z.z * min(length(v - camera), 20.0);
     float time_weight = from_a ? 1.0 - t : t;
     float w = time_weight * exp(clamp(z, -15.0, 6.0));
 

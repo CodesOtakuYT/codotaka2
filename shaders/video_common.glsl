@@ -24,6 +24,7 @@ layout(push_constant, scalar) uniform Push {
     uint debug_luma;          // estimation input (mode 3)
     uint back_vectors;        // flow from A to B
     uint global_flow;         // one B -> A vector for the whole frame (camera motion)
+    vec3 splat_z;             // splat importance weights: color, consistency, motion contrast
 } pc;
 
 const int GRID = 4; // Flow.grid

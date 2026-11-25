@@ -74,6 +74,7 @@ const VideoPush = extern struct {
     debug_luma: u32 = 0,
     back_vectors: u32 = 0,
     global: u32 = 0,
+    splat_z: [3]f32 = .{ 0, 0, 0 },
 };
 
 const spv = struct {
@@ -109,6 +110,9 @@ heaps: vk_core.DescriptorHeaps,
 shaders: vk_core.ShaderCache,
 ids: std.EnumArray(Program, vk_core.ShaderCache.ProgramId),
 splat_id: vk_core.ShaderCache.ComputeId = undefined,
+/// Splat importance weights (color agreement, forward-backward consistency, motion
+/// contrast); tuned with codotaka-eval, overridable via CODOTAKA_SPLAT="c,f,m".
+splat_z: [3]f32 = .{ 24, 1, 0 },
 linear_sampler: vk_core.DescriptorHeaps.SamplerSlot,
 atlas: Atlas,
 /// Shared CPU glyph cache; read-only while render tasks run.
@@ -155,6 +159,11 @@ pub fn create(gpa: Allocator, device: *vk_core.Device, glyphs: *const text.Glyph
     self.ids.set(.rect, try self.shaders.register(.{ .vert = &spv.rect_vert, .frag = &spv.rect_frag }));
     self.ids.set(.luma, try self.shaders.register(.{ .vert = &spv.video_vert, .frag = &spv.luma_frag }));
     self.splat_id = try self.shaders.registerCompute(&spv.splat_comp);
+    if (std.c.getenv("CODOTAKA_SPLAT")) |v| {
+        var it = std.mem.splitScalar(u8, std.mem.span(v), ',');
+        for (&self.splat_z) |*z| z.* = std.fmt.parseFloat(f32, it.next() orelse break) catch z.*;
+        std.log.info("splat weights {any}", .{self.splat_z});
+    }
     self.linear_sampler = try self.heaps.addSampler(.{
         .mag_filter = .linear,
         .min_filter = .linear,
@@ -428,6 +437,7 @@ fn splatFrame(self: *Renderer, cmd: vk.CommandBufferProxy, vd: VideoDraw) !void 
     var vp = try self.videoPush(vd);
     if (vp.mode != @intFromEnum(Interpolation.on)) return;
     vp.data = f.accum.address;
+    vp.splat_z = self.splat_z;
     const all: vk.PipelineStageFlags2 = .{ .all_commands = true };
     const rw: vk.AccessFlags2 = .{ .memory_read = true, .memory_write = true };
     memoryBarrier(cmd, all, rw, .{ .clear = true }, .{ .transfer_write = true });
@@ -514,7 +524,7 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
             .extent = .{ .width = scissor.width, .height = scissor.height },
         }});
 
-        var push: [8 + frame.max_push]u8 align(8) = undefined;
+        var push: [256]u8 align(8) = undefined; // device push data limit (>= 256 B)
         var push_len: usize = 8;
         if (program == .video) {
             const vd = std.mem.bytesToValue(VideoDraw, v.draw.data);

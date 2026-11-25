@@ -54,13 +54,23 @@ Read this first when resuming work. User preferences and decisions are binding.
 - Heat map of the worst frame (interval 110, k=3): the moving bunny's face/body is
   smeared and torn (large motion of a near-camera object), background fine.
 
+## Progress after the handoff
+- Static regression fixed (commit 7aef3d4): full-res crossfade where vectors show no
+  motion. Near-static frames -2.2 → +2.7 dB vs crossfade; worse-than-crossfade frames
+  384 → 241 of 1460. Overall 31.77 dB on BBB 60–90 s.
+- Splat weights tuned with `CODOTAKA_SPLAT=c,f,m` sweeps: (24, 1, 0) is best
+  (motion-contrast term hurts). 60–90 s: 31.89 dB; held-out 300–330 s: 28.96 dB vs
+  crossfade 27.51 dB. Tuning has plateaued (+0.1–0.2 dB): weights are not the bottleneck.
+- On 300–330 s our worst frame (14.5 dB) is below crossfade's worst (16.0 dB):
+  catastrophic failures exist; look at `--worst` heat maps there first.
+
 ## Next steps (in order)
-1. Fix the static-content regression: splat result is built at 1920×1072 (estimation
-   size) and resampled to the frame → softness + sub-pixel shift. Build the in-between
-   frame at full resolution (use low-res motion only), and/or fall back to the crossfade
-   where motion is ~0. Measure with codotaka-eval after every change.
-2. Large near-camera motion (bunny face): tune splat z weights; try 2×2 grid; check
-   whether vectors hit the search limit (FLOW_DUMP); consider 3-level hints.
+1. Investigate catastrophic frames (`codotaka-eval … --start 300 --worst dir/`): likely
+   wrong large vectors splatting content far away; consider a per-frame sanity fallback
+   (e.g. if splat vs crossfade disagree massively, or vectors exceed the search range).
+2. Large near-camera motion (bunny face): try 2×2 grid; check whether vectors hit the
+   search limit (FLOW_DUMP); consider 3-level hints. Full-res splatting matters on 4K
+   playback (eval runs at 1920 wide, roughly the estimation size).
 3. Learned refinement: RTX 3050 has VK_NV_cooperative_matrix2 (reductions, per-element
    ops, conversions, bf16) — a small RIFE-style network in our own compute shaders.
 4. Player leftovers: 5 ms polling during seek/pre-roll (eventfd from audio thread), volume,

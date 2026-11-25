@@ -16,6 +16,7 @@ layout(push_constant, scalar) uniform Push {
     uint debug_luma;
     uint back_vectors;
     uint global_flow;
+    vec3 splat_z;
 } pc;
 
 layout(location = 0) out vec2 v_uv;
