@@ -140,15 +140,6 @@ void main() {
     vec2 g = px / float(GRID) - 0.5;
     ivec2 b0 = ivec2(floor(g));
     float cost = max(max(costAt(b0), costAt(b0 + ivec2(1, 0))), max(costAt(b0 + ivec2(0, 1)), costAt(b0 + ivec2(1, 1))));
-    if (pc.mode == 2u) {
-        // Direction as hue, magnitude as brightness; high cost in red.
-        float mag = clamp(length(f) / 16.0, 0.0, 1.0);
-        vec3 dir = 0.5 + 0.5 * vec3(f.x, f.y, -f.x) / max(length(f), 1e-3);
-        vec3 c = mix(shade(uv, pc.luma, pc.chroma) * 0.25, dir * mag, 0.85);
-        float bad = max(smoothstep(64.0, 200.0, cost), smoothstep(0.75, 2.5, fb_error));
-        out_color = encodeOutput(vec4(mix(c, vec3(1, 0, 0), bad * 0.6), 1.0));
-        return;
-    }
     // A pixel at x on the in-between frame came from x + alpha*f in A and is going to
     // x - (1 - alpha)*f in B (f evaluated at x approximates the vector along its path).
     vec2 fuv = f / pc.flow_size * pc.uv_max;
@@ -158,10 +149,26 @@ void main() {
     // A correct vector brings the same content from both frames; where the warped samples
     // disagree (fades, occlusions, noise in flat areas) or the accelerator reports a high
     // cost, fall back to a plain blend of the two frames at this pixel.
-    vec3 blend = mix(shade(uv, pc.luma, pc.chroma), shade(uv, pc.luma_b, pc.chroma_b), pc.alpha);
-    vec3 d = abs(a - bc) / max(pc.white_scale, 1e-3);
+    vec3 still_a = shade(uv, pc.luma, pc.chroma);
+    vec3 still_b = shade(uv, pc.luma_b, pc.chroma_b);
+    vec3 blend = mix(still_a, still_b, pc.alpha);
+    float inv_white = 1.0 / max(pc.white_scale, 1e-3);
+    vec3 d = abs(a - bc) * inv_white;
     float mismatch = max(d.r, max(d.g, d.b));
+    // The vector must explain the two frames clearly better than standing still does
+    // (flat or unchanged areas get noise vectors that "match" just as well).
+    vec3 d0 = abs(still_a - still_b) * inv_white;
+    float still_mismatch = max(d0.r, max(d0.g, d0.b));
     float trust = (1.0 - smoothstep(0.04, 0.12, mismatch)) * (1.0 - smoothstep(64.0, 200.0, cost))
-                * (1.0 - smoothstep(0.75, 2.5, fb_error));
+                * (1.0 - smoothstep(0.75, 2.5, fb_error))
+                * smoothstep(0.01, 0.04, still_mismatch - mismatch);
+    if (pc.mode == 2u) {
+        // Vectors as used: direction as hue, magnitude as brightness; rejected ones dark.
+        vec2 fu = f * trust;
+        float mag = clamp(length(fu) / 8.0, 0.0, 1.0);
+        vec3 dir = 0.5 + 0.5 * vec3(fu.x, fu.y, -fu.x) / max(length(fu), 1e-3);
+        out_color = encodeOutput(vec4(mix(still_a * 0.2, dir * pc.white_scale, mag), 1.0));
+        return;
+    }
     out_color = encodeOutput(vec4(mix(blend, warped, trust), 1.0));
 }
