@@ -83,8 +83,9 @@ release_eventfd: drm_sync.EventFd,
 
 /// Fails with error.NoCompatibleTranche if the compositor can't take this presenter's
 /// dmabufs for this surface, or error.ColorModeUnsupported. Buffers are allocated lazily.
-pub fn create(gpa: Allocator, presenter: *Presenter, surface: *wl.Surface, color: wl.ColorMode) !*SurfaceTarget {
-    const format = formats.forMode(color);
+pub fn create(gpa: Allocator, presenter: *Presenter, surface: *wl.Surface, color: wl.ColorMode, translucent: bool) !*SurfaceTarget {
+    const format = formats.forMode(color, translucent);
+    surface.setOpaque(!translucent);
     if (!presenter.supportsFormat(format)) return error.ColorModeUnsupported;
     try surface.setImageDescription(try surface.display.imageDescription(color));
 
@@ -255,7 +256,7 @@ pub fn begin(self: *SurfaceTarget, cmd: vk.CommandBufferProxy, b: *Buffer) Prese
         .dst_stage = .{ .color_attachment_output = true },
         .dst_access = .{ .color_attachment_write = true, .color_attachment_read = true },
     });
-    return .{ .view = b.image.view, .extent = b.image.extent, .format = self.format.vk };
+    return .{ .view = b.image.view, .extent = b.image.extent, .format = self.format.vk, .translucent = self.format.alpha, .encode = self.format.encode };
 }
 
 /// Releases `b` to the compositor (foreign queue family). Layout stays GENERAL; the

@@ -7,9 +7,13 @@ const vk = @import("vulkan");
 const c = @import("av_c");
 
 av: *c.AVFrame,
-/// Presentation timestamp (stream time, ns; keeps increasing across loops).
+/// Presentation timestamp (media time, ns; keeps increasing across loops and seeks).
 pts_ns: i64,
+/// Position within the file (ns), for display.
+stream_ns: i64,
 duration_ns: i64,
+/// Seek generation the frame belongs to; frames of older generations are stale.
+generation: u32,
 
 pub fn release(self: *Frame) void {
     var f: ?*c.AVFrame = self.av;

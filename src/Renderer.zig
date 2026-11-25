@@ -15,7 +15,20 @@ const media = @import("media");
 const Atlas = @import("Atlas.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Program = enum(u32) { triangle, decoration, text, video };
+pub const Program = enum(u32) { triangle, decoration, text, video, rect };
+
+/// Instance layout read by shaders/rect.vert; draws carry `[]RectInstance` as data and
+/// `RectPush` as push data.
+pub const RectInstance = extern struct { pos: [2]f32, size: [2]f32, color: [4]f32, radius: f32 };
+pub const RectPush = extern struct { size_px: [2]f32, white_scale: f32, _pad: f32 = 0 };
+
+pub fn rects(instances: []const RectInstance, size_px: [2]f32, white_scale: f32) frame.Draw {
+    var d = frame.Draw.init(@intFromEnum(Program.rect), RectPush{ .size_px = size_px, .white_scale = white_scale });
+    d.data = std.mem.sliceAsBytes(instances);
+    d.vertex_count = 6;
+    d.instance_count = @intCast(instances.len);
+    return d;
+}
 
 /// Per-draw data of video draws: which decoded frame, and where to put it.
 pub const VideoDraw = extern struct {
@@ -51,6 +64,8 @@ const spv = struct {
     const text_vert align(@alignOf(u32)) = @embedFile("text.vert.spv").*;
     const text_frag align(@alignOf(u32)) = @embedFile("text.frag.spv").*;
     const video_vert align(@alignOf(u32)) = @embedFile("video.vert.spv").*;
+    const rect_vert align(@alignOf(u32)) = @embedFile("rect.vert.spv").*;
+    const rect_frag align(@alignOf(u32)) = @embedFile("rect.frag.spv").*;
     const video_frag align(@alignOf(u32)) = @embedFile("video.frag.spv").*;
 };
 
@@ -104,6 +119,7 @@ pub fn create(gpa: Allocator, device: *vk_core.Device, glyphs: *const text.Glyph
     self.ids.set(.decoration, try self.shaders.register(.{ .vert = &spv.decoration_vert, .frag = &spv.decoration_frag }));
     self.ids.set(.text, try self.shaders.register(.{ .vert = &spv.text_vert, .frag = &spv.text_frag }));
     self.ids.set(.video, try self.shaders.register(.{ .vert = &spv.video_vert, .frag = &spv.video_frag }));
+    self.ids.set(.rect, try self.shaders.register(.{ .vert = &spv.rect_vert, .frag = &spv.rect_frag }));
     self.linear_sampler = try self.heaps.addSampler(.{
         .mag_filter = .linear,
         .min_filter = .linear,
@@ -248,7 +264,7 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
         .resolve_image_layout = .undefined,
         .load_op = .clear,
         .store_op = .store,
-        .clear_value = .{ .color = .{ .float_32 = .{ 0.002, 0.002, 0.003, 1.0 } } },
+        .clear_value = .{ .color = .{ .float_32 = if (target.translucent) .{ 0, 0, 0, 0 } else .{ 0.002, 0.002, 0.003, 1.0 } } },
     }};
     cmd.beginRendering(&.{
         .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = target.extent },
@@ -267,8 +283,8 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
         if (v.draw.instance_count == 0) continue;
         const program: Program = @enumFromInt(v.draw.program);
         if (bound != v.draw.program) {
-            self.shaders.bind(cmd, self.ids.get(program));
-            vk_core.ShaderCache.setBlend(cmd, if (program == .text) .premultiplied else .none);
+            self.shaders.bind(cmd, self.ids.get(program), @intFromEnum(target.encode));
+            vk_core.ShaderCache.setBlend(cmd, if (program == .text or program == .rect) .premultiplied else .none);
             bound = v.draw.program;
         }
         cmd.setViewportWithCount(&.{.{

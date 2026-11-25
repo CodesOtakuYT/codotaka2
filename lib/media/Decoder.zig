@@ -22,7 +22,9 @@ pub const packet_depth = 512;
 
 /// Demux -> video decode messages.
 const VideoItem = union(enum) {
-    packet: *c.AVPacket,
+    packet: struct { pkt: *c.AVPacket, generation: u32 },
+    /// Seek: flush the decoder; frames before `target_ns` (stream time) are skipped.
+    seek: struct { generation: u32, offset_ns: i64, target_ns: i64 },
     /// End of stream: flush the decoder, then continue with timestamps offset by this
     /// (looping), or stop.
     end: ?i64,
@@ -48,6 +50,20 @@ queue_buf: [queue_depth]Frame = undefined,
 packets: Io.Queue(VideoItem),
 packets_buf: [packet_depth]VideoItem = undefined,
 demux_task: ?Io.Future(anyerror!void) = null,
+/// Pending seek target (stream ns), or -1.
+/// Pending seek: (generation << 47) | target stream ns, or -1. Target and generation
+/// travel together so the demuxer never applies a target under the wrong generation.
+seek_request: std.atomic.Value(i64) = .init(-1),
+/// Last generation handed out by `seek` (UI thread only).
+requested_generation: u16 = 0,
+/// Video task: drop decoded frames before this stream time (after a seek), or -1.
+skip_before_ns: i64 = -1,
+/// Video task: generation of the packets it is decoding (frames are tagged with it).
+video_generation: u32 = 0,
+/// Bumped by every seek; tags packets, frames and audio segments.
+generation: std.atomic.Value(u32) = .init(0),
+/// File duration (ns), 0 if unknown.
+duration_ns: i64 = 0,
 video_task: ?Io.Future(anyerror!void) = null,
 wake_fd: linux.fd_t,
 
@@ -105,6 +121,7 @@ pub fn open(gpa: Allocator, io: Io, hw: *HwDevice, path: [:0]const u8, opts: Opt
     };
     self.queue = .init(&self.queue_buf);
     self.packets = .init(&self.packets_buf);
+    if (self.fmt.duration != c.AV_NOPTS_VALUE) self.duration_ns = self.fmt.duration * (std.time.ns_per_s / c.AV_TIME_BASE);
     codec.*.@"opaque" = self;
     try HwDevice.check(c.avcodec_open2(codec, codec_info, null), "avcodec_open2");
     self.audio = openAudio(gpa, self.fmt, index) catch |err| blk: {
@@ -177,7 +194,7 @@ pub fn close(self: *Decoder) void {
         const n = self.packets.getUncancelable(self.io, &items, 0) catch break;
         if (n == 0) break;
         for (items[0..n]) |it| if (it == .packet) {
-            var p: ?*c.AVPacket = it.packet;
+            var p: ?*c.AVPacket = it.packet.pkt;
             c.av_packet_free(&p);
         };
     }
@@ -193,6 +210,24 @@ pub fn close(self: *Decoder) void {
     c.avformat_close_input(&fmt);
     _ = linux.close(self.wake_fd);
     self.gpa.destroy(self);
+}
+
+/// Requests a seek to `stream_ns` (clamped to the file); applied by the decode tasks.
+/// Returns the generation that frames of the new position will carry.
+pub fn seek(self: *Decoder, stream_ns: i64) u32 {
+    const max = if (self.duration_ns > 0) self.duration_ns - 1 else std.math.maxInt(i64);
+    self.requested_generation +%= 1;
+    const target = std.math.clamp(stream_ns, 0, @min(max, (1 << 47) - 1));
+    self.seek_request.store((@as(i64, self.requested_generation) << 47) | target, .release);
+    return self.requested_generation;
+}
+
+pub fn currentGeneration(self: *const Decoder) u32 {
+    return self.generation.load(.acquire);
+}
+
+fn seekPending(self: *const Decoder) bool {
+    return self.seek_request.load(.acquire) >= 0;
 }
 
 /// Non-blocking: moves up to `out.len` decoded frames out of the queue.
@@ -224,7 +259,25 @@ fn demuxLoop(self: *Decoder) anyerror!void {
 
     var loop_offset_ns: i64 = 0;
     var video_end_ns: i64 = 0; // end of the latest video packet in this pass
+    var audio_skip_before: i64 = -1; // after a seek: drop audio before the target
     while (true) {
+        const packed_request = self.seek_request.swap(-1, .acq_rel);
+        if (packed_request >= 0) {
+            const request = packed_request & ((1 << 47) - 1);
+            const gen: u32 = @intCast(packed_request >> 47);
+            self.generation.store(gen, .release);
+            try HwDevice.check(c.av_seek_frame(self.fmt, -1, @divFloor(request, std.time.ns_per_s / c.AV_TIME_BASE), c.AVSEEK_FLAG_BACKWARD), "av_seek_frame");
+            if (self.audio) |*a| {
+                c.avcodec_flush_buffers(a.codec);
+                a.ring.startSegment();
+            }
+            audio_skip_before = request;
+            // Media time keeps increasing: continue from the furthest point reached.
+            loop_offset_ns = video_end_ns - request;
+            video_end_ns = loop_offset_ns + request;
+            try self.packets.putOne(self.io, .{ .seek = .{ .generation = gen, .offset_ns = loop_offset_ns, .target_ns = request } });
+            continue;
+        }
         const rc = c.av_read_frame(self.fmt, pkt);
         if (rc == c.AVERROR_EOF) {
             if (self.audio) |*a| {
@@ -249,13 +302,13 @@ fn demuxLoop(self: *Decoder) anyerror!void {
             if (pkt.*.pts != c.AV_NOPTS_VALUE)
                 video_end_ns = @max(video_end_ns, loop_offset_ns + self.toNs(pkt.*.pts + pkt.*.duration));
             const owned = c.av_packet_clone(pkt) orelse return error.OutOfMemory;
-            self.packets.putOne(self.io, .{ .packet = owned }) catch |err| {
+            self.packets.putOne(self.io, .{ .packet = .{ .pkt = owned, .generation = self.generation.load(.monotonic) } }) catch |err| {
                 var p: ?*c.AVPacket = owned;
                 c.av_packet_free(&p);
                 return err;
             };
         } else if (self.audio) |*a| if (pkt.*.stream_index == a.stream.index) {
-            if (c.avcodec_send_packet(a.codec, pkt) >= 0) try self.drainAudio(a, frame, loop_offset_ns);
+            if (c.avcodec_send_packet(a.codec, pkt) >= 0) try self.drainAudioFrom(a, frame, loop_offset_ns, audio_skip_before);
         };
     }
 }
@@ -276,13 +329,21 @@ fn videoLoop(self: *Decoder) anyerror!void {
             else => return err,
         };
         switch (item) {
-            .packet => |pkt| {
+            .packet => |p| {
                 defer {
-                    var p: ?*c.AVPacket = pkt;
-                    c.av_packet_free(&p);
+                    var pp: ?*c.AVPacket = p.pkt;
+                    c.av_packet_free(&pp);
                 }
-                try HwDevice.check(c.avcodec_send_packet(self.codec, pkt), "avcodec_send_packet");
+                // Packets queued before a seek are dropped without decoding.
+                if (p.generation != self.video_generation or self.generation.load(.acquire) != self.video_generation or self.seekPending()) continue;
+                try HwDevice.check(c.avcodec_send_packet(self.codec, p.pkt), "avcodec_send_packet");
                 try self.drain(frame, loop_offset_ns, &last_pts_ns);
+            },
+            .seek => |sk| {
+                c.avcodec_flush_buffers(self.codec);
+                loop_offset_ns = sk.offset_ns;
+                self.video_generation = sk.generation;
+                self.skip_before_ns = sk.target_ns;
             },
             .end => |next_offset| {
                 try HwDevice.check(c.avcodec_send_packet(self.codec, null), "avcodec_send_packet(flush)");
@@ -296,6 +357,7 @@ fn videoLoop(self: *Decoder) anyerror!void {
 }
 
 fn drain(self: *Decoder, frame: *c.AVFrame, offset_ns: i64, last_pts_ns: *i64) !void {
+    const gen = self.video_generation;
     while (true) {
         const rc = c.avcodec_receive_frame(self.codec, frame);
         if (rc == c.AVERROR(c.EAGAIN) or rc == c.AVERROR_EOF) return;
@@ -308,9 +370,18 @@ fn drain(self: *Decoder, frame: *c.AVFrame, offset_ns: i64, last_pts_ns: *i64) !
         const owned = c.av_frame_alloc() orelse return error.OutOfMemory;
         c.av_frame_move_ref(owned, frame);
         const pts = if (owned.*.best_effort_timestamp != c.AV_NOPTS_VALUE) owned.*.best_effort_timestamp else owned.*.pts;
-        const pts_ns = offset_ns + self.toNs(pts);
+        const stream_ns = self.toNs(pts);
+        // After a seek, frames decoded from the preceding keyframe up to the target are
+        // not shown (accurate seeking).
+        if (stream_ns + @divFloor(self.frameDurationNs(), 2) < self.skip_before_ns) {
+            var drop: ?*c.AVFrame = owned;
+            c.av_frame_free(&drop);
+            continue;
+        }
+        self.skip_before_ns = -1;
+        const pts_ns = offset_ns + stream_ns;
         last_pts_ns.* = pts_ns;
-        var f: Frame = .{ .av = owned, .pts_ns = pts_ns, .duration_ns = self.frameDurationNs() };
+        var f: Frame = .{ .av = owned, .pts_ns = pts_ns, .stream_ns = stream_ns, .duration_ns = self.frameDurationNs(), .generation = gen };
         self.queue.putOne(self.io, f) catch |err| {
             f.release();
             return err; // Canceled or Closed: shutting down
@@ -320,15 +391,23 @@ fn drain(self: *Decoder, frame: *c.AVFrame, offset_ns: i64, last_pts_ns: *i64) !
     }
 }
 
-/// Decodes, resamples and pushes audio into the ring, waiting (cancelably) while it is full.
 fn drainAudio(self: *Decoder, a: *AudioTrack, frame: *c.AVFrame, offset_ns: i64) !void {
+    return self.drainAudioFrom(a, frame, offset_ns, -1);
+}
+
+/// Decodes, resamples and pushes audio into the ring, waiting (cancelably) while it is
+/// full; frames before `skip_before` (stream ns, after a seek) are dropped.
+fn drainAudioFrom(self: *Decoder, a: *AudioTrack, frame: *c.AVFrame, offset_ns: i64, skip_before: i64) !void {
     while (true) {
         const rc = c.avcodec_receive_frame(a.codec, frame);
         if (rc == c.AVERROR(c.EAGAIN) or rc == c.AVERROR_EOF) return;
         if (rc < 0) return; // corrupt audio is skipped, video continues
         defer c.av_frame_unref(frame);
-        if (frame.pts != c.AV_NOPTS_VALUE)
-            a.ring.setBase(offset_ns + c.av_rescale_q(frame.pts, a.stream.time_base, .{ .num = 1, .den = 1_000_000_000 }));
+        if (frame.pts != c.AV_NOPTS_VALUE) {
+            const stream_ns = c.av_rescale_q(frame.pts, a.stream.time_base, .{ .num = 1, .den = 1_000_000_000 });
+            if (skip_before >= 0 and stream_ns < skip_before) continue;
+            a.ring.setBase(offset_ns + stream_ns);
+        }
         var out: [*c]u8 = @ptrCast(a.scratch.ptr);
         const max_frames: c_int = @intCast(a.scratch.len / Audio.channels);
         const n = c.swr_convert(a.swr, &out, max_frames, @ptrCast(frame.extended_data), frame.nb_samples);
@@ -337,7 +416,10 @@ fn drainAudio(self: *Decoder, a: *AudioTrack, frame: *c.AVFrame, offset_ns: i64)
         while (pending.len > 0) {
             const written = a.ring.write(pending);
             pending = pending[written * Audio.channels ..];
-            if (pending.len > 0) try self.io.sleep(.fromMilliseconds(5), .awake);
+            if (pending.len > 0) {
+                if (self.seekPending()) return; // the rest is stale; apply the seek
+                try self.io.sleep(.fromMilliseconds(5), .awake);
+            }
         }
     }
 }

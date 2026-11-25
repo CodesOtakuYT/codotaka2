@@ -15,7 +15,10 @@ pub const Program = struct {
 
 pub const ProgramId = enum(u32) { _ };
 
-const Shaders = struct { vert: vk.ShaderEXT, frag: vk.ShaderEXT };
+/// Fragment variants per output encoding (specialization constant 0 in shaders/output.glsl).
+pub const output_variants = 2;
+
+const Shaders = struct { vert: vk.ShaderEXT, frag: [output_variants]vk.ShaderEXT };
 
 gpa: Allocator,
 device: *Device,
@@ -29,7 +32,7 @@ pub fn init(gpa: Allocator, device: *Device) ShaderCache {
 pub fn deinit(self: *ShaderCache) void {
     for (self.programs.items) |p| {
         self.device.proxy.destroyShaderEXT(p.vert, null);
-        self.device.proxy.destroyShaderEXT(p.frag, null);
+        for (p.frag) |f| self.device.proxy.destroyShaderEXT(f, null);
     }
     self.programs.deinit(self.gpa);
 }
@@ -37,34 +40,41 @@ pub fn deinit(self: *ShaderCache) void {
 pub fn register(self: *ShaderCache, program: Program) !ProgramId {
     try self.programs.ensureUnusedCapacity(self.gpa, 1);
     const flags: vk.ShaderCreateFlagsEXT = .{ .descriptor_heap_ext = true };
-    const infos = [_]vk.ShaderCreateInfoEXT{
-        .{
-            .flags = flags,
-            .stage = .{ .vertex = true },
-            .next_stage = .{ .fragment = true },
-            .code_type = .spirv_ext,
-            .code_size = program.vert.len,
-            .p_code = program.vert.ptr,
-            .p_name = "main",
-        },
-        .{
+    const values = [output_variants]u32{ 0, 1 };
+    const entry = [_]vk.SpecializationMapEntry{.{ .constant_id = 0, .offset = 0, .size = @sizeOf(u32) }};
+    var specs: [output_variants]vk.SpecializationInfo = undefined;
+    var infos: [1 + output_variants]vk.ShaderCreateInfoEXT = undefined;
+    infos[0] = .{
+        .flags = flags,
+        .stage = .{ .vertex = true },
+        .next_stage = .{ .fragment = true },
+        .code_type = .spirv_ext,
+        .code_size = program.vert.len,
+        .p_code = program.vert.ptr,
+        .p_name = "main",
+    };
+    for (&specs, &values, infos[1..]) |*spec, *value, *info| {
+        spec.* = .{ .map_entry_count = entry.len, .p_map_entries = &entry, .data_size = @sizeOf(u32), .p_data = value };
+        info.* = .{
             .flags = flags,
             .stage = .{ .fragment = true },
             .code_type = .spirv_ext,
             .code_size = program.frag.len,
             .p_code = program.frag.ptr,
             .p_name = "main",
-        },
-    };
-    var shaders: [2]vk.ShaderEXT = undefined;
+            .p_specialization_info = spec,
+        };
+    }
+    var shaders: [1 + output_variants]vk.ShaderEXT = undefined;
     _ = try self.device.proxy.createShadersEXT(&infos, null, &shaders);
-    self.programs.appendAssumeCapacity(.{ .vert = shaders[0], .frag = shaders[1] });
+    self.programs.appendAssumeCapacity(.{ .vert = shaders[0], .frag = shaders[1..].* });
     return @enumFromInt(self.programs.items.len - 1);
 }
 
-pub fn bind(self: *const ShaderCache, cmd: vk.CommandBufferProxy, id: ProgramId) void {
+/// Binds a program with the fragment variant for `output_variant` (target encoding).
+pub fn bind(self: *const ShaderCache, cmd: vk.CommandBufferProxy, id: ProgramId, output_variant: u32) void {
     const p = self.programs.items[@intFromEnum(id)];
-    cmd.bindShadersEXT(&.{ .{ .vertex = true }, .{ .fragment = true } }, &.{ p.vert, p.frag });
+    cmd.bindShadersEXT(&.{ .{ .vertex = true }, .{ .fragment = true } }, &.{ p.vert, p.frag[output_variant] });
 }
 
 pub const Blend = enum { none, premultiplied };

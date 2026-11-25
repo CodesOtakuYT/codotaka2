@@ -208,11 +208,15 @@ pub fn build(b: *std.Build) void {
         "shaders/text.frag",
         "shaders/video.vert",
         "shaders/video.frag",
+        "shaders/rect.vert",
+        "shaders/rect.frag",
         "lib/csd/shaders/decoration.vert",
         "lib/csd/shaders/decoration.frag",
     };
     for (shaders) |path| {
-        const glslc = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.4" });
+        const glslc = b.addSystemCommand(&.{ "glslc", "--target-env=vulkan1.4", "-I" });
+        glslc.addDirectoryArg(b.path("shaders"));
+        glslc.addFileInput(b.path("shaders/output.glsl"));
         glslc.addFileArg(b.path(path));
         glslc.addArg("-o");
         const name = std.fs.path.basename(path);

@@ -29,6 +29,8 @@ width: u32 = 1,
 height: u32 = 1,
 /// Buffer size changed (logical size or scale); buffers must be reallocated.
 size_changed: bool = true,
+/// Content covers the whole surface with alpha 1 (sets the opaque region).
+is_opaque: bool = true,
 
 stats: root.PresentStats = .{},
 /// Outstanding presentation feedback objects, destroyed with the surface so their
@@ -100,10 +102,22 @@ pub fn setSize(self: *Surface, width: u32, height: u32) void {
     self.width = w;
     self.height = h;
     self.size_changed = true;
-    // Our content is always opaque; this lets the compositor skip blending and
-    // makes the surface a better overlay-plane candidate.
+    self.updateOpaqueRegion();
+}
+
+/// Opaque surfaces let the compositor skip blending and are better overlay-plane candidates.
+pub fn setOpaque(self: *Surface, is_opaque: bool) void {
+    self.is_opaque = is_opaque;
+    self.updateOpaqueRegion();
+}
+
+fn updateOpaqueRegion(self: *Surface) void {
+    if (!self.is_opaque) {
+        c.wl_surface_set_opaque_region(self.wl_surface, null);
+        return;
+    }
     const region = c.wl_compositor_create_region(self.display.compositor);
-    c.wl_region_add(region, 0, 0, @intCast(w), @intCast(h));
+    c.wl_region_add(region, 0, 0, @intCast(self.width), @intCast(self.height));
     c.wl_surface_set_opaque_region(self.wl_surface, region);
     c.wl_region_destroy(region);
 }

@@ -87,7 +87,7 @@ pub fn Scene(comptime Target: type) type {
         /// Creates/destroys targets for new nodes (e.g. on the window's GPU).
         pub const TargetFactory = struct {
             ctx: *anyopaque,
-            create: *const fn (ctx: *anyopaque, surface: *wl.Surface) anyerror!*Target,
+            create: *const fn (ctx: *anyopaque, surface: *wl.Surface, translucent: bool) anyerror!*Target,
             destroy: *const fn (ctx: *anyopaque, target: *Target) void,
         };
 
@@ -229,13 +229,22 @@ pub fn Scene(comptime Target: type) type {
                 }
             };
 
+            pub const NodeOptions = struct {
+                /// Content has transparency (alpha format, no opaque region).
+                translucent: bool = false,
+            };
+
             /// Adds a subsurface node under `parent`.
             pub fn addNode(self: *SceneWindow, name: []const u8, parent: NodeId) !NodeId {
+                return self.addNodeWith(name, parent, .{});
+            }
+
+            pub fn addNodeWith(self: *SceneWindow, name: []const u8, parent: NodeId, opts: NodeOptions) !NodeId {
                 const p = self.node(parent) orelse return error.StaleNode;
                 try self.node_order.ensureUnusedCapacity(self.gpa, 1);
                 const surface = try self.window.createSubsurface(p.surface);
                 errdefer self.window.destroySubsurface(surface);
-                const target = try self.factory.create(self.factory.ctx, surface);
+                const target = try self.factory.create(self.factory.ctx, surface, opts.translucent);
                 errdefer self.factory.destroy(self.factory.ctx, target);
                 const n = try self.gpa.create(Node);
                 errdefer self.gpa.destroy(n);

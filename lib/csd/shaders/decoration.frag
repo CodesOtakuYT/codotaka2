@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "output.glsl"
 
 // Client-side title bar: background and minimize/maximize/close buttons, procedural so it
 // is resolution independent under fractional scaling. The title is drawn as shaped text.
@@ -79,5 +81,5 @@ void main() {
     // 1px separator at the bottom.
     if (q.y >= h - aa) color *= 0.5;
 
-    out_color = vec4(color * pc.white_scale, 1.0);
+    out_color = encodeOutput(vec4(color * pc.white_scale, 1.0));
 }

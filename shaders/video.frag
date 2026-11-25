@@ -3,6 +3,8 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "output.glsl"
 
 // Zero-copy video: the decoder's VkImage planes are sampled straight from the heap.
 layout(descriptor_heap) uniform texture2D textures[];
@@ -77,7 +79,7 @@ void main() {
     }
 
     if (pc.output_hdr != 0) {
-        out_color = vec4(lin * pc.white_scale, 1.0);
+        out_color = encodeOutput(vec4(lin * pc.white_scale, 1.0));
     } else {
         // SDR target: tone map HDR content (extended Reinhard on luminance), then clip.
         if (pc.transfer != 0u) {
@@ -85,6 +87,6 @@ void main() {
             float mapped = l * (1.0 + l / (pc.peak * pc.peak)) / (1.0 + l);
             lin *= mapped / max(l, 1e-6);
         }
-        out_color = vec4(clamp(lin, 0.0, 1.0) * pc.white_scale, 1.0);
+        out_color = encodeOutput(vec4(clamp(lin, 0.0, 1.0) * pc.white_scale, 1.0));
     }
 }

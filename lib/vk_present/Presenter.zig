@@ -43,6 +43,10 @@ pub const Recorder = struct {
         view: vk.ImageView,
         extent: vk.Extent2D,
         format: vk.Format,
+        /// Clear to transparent and keep alpha (premultiplied).
+        translucent: bool = false,
+        /// Output encoding shaders must apply (formats.Encode).
+        encode: formats.Encode = .none,
     };
 };
 

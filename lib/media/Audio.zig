@@ -20,9 +20,13 @@ pub const Ring = struct {
     capacity: u64, // frames, power of two
     write_pos: std.atomic.Value(u64) = .init(0),
     read_pos: std.atomic.Value(u64) = .init(0),
-    /// Media timestamp of frame 0 (set once by the producer before the first write).
+    /// Media timestamp of frame `base_index` (set by the producer at the start of each
+    /// segment, i.e. at startup and after every seek).
     base_pts_ns: std.atomic.Value(i64) = .init(0),
+    base_index: std.atomic.Value(u64) = .init(0),
     has_base: std.atomic.Value(bool) = .init(false),
+    /// Frames before this index belong to a previous segment and are skipped by the reader.
+    discard_before: std.atomic.Value(u64) = .init(0),
 
     pub fn init(gpa: Allocator, seconds: u32) !Ring {
         const frames = std.math.ceilPowerOfTwoAssert(u64, @as(u64, rate) * seconds);
@@ -35,8 +39,24 @@ pub const Ring = struct {
 
     pub fn setBase(self: *Ring, pts_ns: i64) void {
         if (self.has_base.load(.acquire)) return;
+        self.base_index.store(self.write_pos.load(.monotonic), .monotonic);
         self.base_pts_ns.store(pts_ns, .monotonic);
         self.has_base.store(true, .release);
+    }
+
+    /// Producer: starts a new segment (seek). Everything written so far is dropped by the
+    /// reader; the next `setBase` defines timestamps from here on.
+    pub fn startSegment(self: *Ring) void {
+        self.has_base.store(false, .release);
+        self.discard_before.store(self.write_pos.load(.monotonic), .release);
+    }
+
+    /// Media timestamp of frame `index`, if its segment has a base.
+    pub fn ptsOf(self: *const Ring, index: u64) ?i64 {
+        if (!self.has_base.load(.acquire)) return null;
+        const base = self.base_index.load(.monotonic);
+        if (index < base) return null;
+        return self.base_pts_ns.load(.monotonic) + @as(i64, @intCast(@divFloor((index - base) * std.time.ns_per_s, rate)));
     }
 
     /// Producer: writes as many whole frames as fit; returns frames written.
@@ -55,7 +75,9 @@ pub const Ring = struct {
 
     /// Consumer: reads up to out.len / channels frames; returns (first frame index, count).
     pub fn read(self: *Ring, out: []f32) struct { first: u64, frames: usize } {
-        const r = self.read_pos.load(.monotonic);
+        var r = self.read_pos.load(.monotonic);
+        const discard = self.discard_before.load(.acquire);
+        if (r < discard) r = discard; // skip the previous segment (seek)
         const w = self.write_pos.load(.acquire);
         const n: u64 = @min(w - r, out.len / channels);
         for (0..n) |i| {
@@ -149,9 +171,6 @@ pub const Output = struct {
         const got = self.ring.read(dst);
         @memset(dst[got.frames * channels ..], 0);
         if (got.frames < frames) _ = self.underruns.fetchAdd(1, .monotonic);
-        if (got.frames > 0 and self.ring.has_base.load(.acquire)) {
-            const pts = self.ring.base_pts_ns.load(.monotonic) + @as(i64, @intCast(@divFloor(got.first * std.time.ns_per_s, rate)));
-            self.clock.publish(heard_at_ns, pts);
-        }
+        if (got.frames > 0) if (self.ring.ptsOf(got.first)) |pts| self.clock.publish(heard_at_ns, pts);
     }
 };

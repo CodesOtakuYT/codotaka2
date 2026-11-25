@@ -3,6 +3,8 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "output.glsl"
 
 // Bindless: the bound descriptor heaps, indexed by slot (SPV_EXT_descriptor_heap).
 layout(descriptor_heap) uniform texture2D textures[];
@@ -24,5 +26,5 @@ layout(location = 0) out vec4 out_color;
 
 void main() {
     float coverage = texture(sampler2D(textures[nonuniformEXT(pc.atlas)], samplers[pc.sampler_slot]), v_uv).r;
-    out_color = v_color * coverage * vec4(vec3(pc.white_scale), 1.0);
+    out_color = encodeOutput(v_color * coverage * vec4(vec3(pc.white_scale), 1.0));
 }

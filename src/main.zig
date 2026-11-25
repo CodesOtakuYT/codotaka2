@@ -83,9 +83,9 @@ const Binding = struct {
     fn factory(self: *Binding) Scene.TargetFactory {
         return .{ .ctx = self, .create = createTarget, .destroy = destroyTarget };
     }
-    fn createTarget(ctx: *anyopaque, surface: *wl.Surface) anyerror!*vk_present.SurfaceTarget {
+    fn createTarget(ctx: *anyopaque, surface: *wl.Surface, translucent: bool) anyerror!*vk_present.SurfaceTarget {
         const self: *Binding = @ptrCast(@alignCast(ctx));
-        return vk_present.SurfaceTarget.create(self.gpa, self.gpu.presenter, surface, self.color);
+        return vk_present.SurfaceTarget.create(self.gpa, self.gpu.presenter, surface, self.color, translucent);
     }
     fn destroyTarget(_: *anyopaque, target: *vk_present.SurfaceTarget) void {
         target.destroy();
@@ -203,7 +203,7 @@ const App = struct {
         const root_target = for (0..app.gpus.len) |offset| {
             const gpu = app.gpus[(index + offset) % app.gpus.len];
             binding.* = .{ .gpa = gpa, .gpu = gpu, .color = app.color };
-            break vk_present.SurfaceTarget.create(gpa, gpu.presenter, window.root, app.color) catch |err| switch (err) {
+            break vk_present.SurfaceTarget.create(gpa, gpu.presenter, window.root, app.color, false) catch |err| switch (err) {
                 error.NoCompatibleTranche, error.ColorModeUnsupported => continue,
                 else => return err,
             };
@@ -215,7 +215,7 @@ const App = struct {
             root_target: *vk_present.SurfaceTarget,
             binding: *Binding,
             pub fn call(c: @This(), hooks: Scene.Hooks) !*Scene.SceneWindow {
-                return Scene.SceneWindow.create(c.gpa, c.window, c.root_target, c.binding.color, vk_present.formats.forMode(c.binding.color).white_scale, c.binding.factory(), hooks);
+                return Scene.SceneWindow.create(c.gpa, c.window, c.root_target, c.binding.color, vk_present.formats.forMode(c.binding.color, false).white_scale, c.binding.factory(), hooks);
             }
         };
         const creator: Creator = .{ .gpa = gpa, .window = window, .root_target = root_target, .binding = binding };
