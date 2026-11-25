@@ -182,12 +182,7 @@ pub fn build(b: *std.Build) void {
 
     // ---------------------------------------------------------------------------------
     // Application.
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{
+    const app_imports: []const std.Build.Module.Import = &.{
             .{ .name = "vulkan", .module = vulkan },
             .{ .name = "geom", .module = geom },
             .{ .name = "wl", .module = wl },
@@ -198,7 +193,21 @@ pub fn build(b: *std.Build) void {
             .{ .name = "csd", .module = csd },
             .{ .name = "text", .module = text },
             .{ .name = "media", .module = media },
-        },
+    };
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = app_imports,
+    });
+    // Offline interpolation quality tool: same renderer, decoder and shaders, no window.
+    const eval_mod = b.createModule(.{
+        .root_source_file = b.path("src/eval_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = app_imports,
     });
 
     const shaders = [_][]const u8{
@@ -213,6 +222,7 @@ pub fn build(b: *std.Build) void {
         "shaders/luma.frag",
         "shaders/splat.comp",
         "shaders/metric.comp",
+        "shaders/heat.comp",
         "lib/csd/shaders/decoration.vert",
         "lib/csd/shaders/decoration.frag",
     };
@@ -225,11 +235,12 @@ pub fn build(b: *std.Build) void {
         glslc.addArg("-o");
         const name = std.fs.path.basename(path);
         const spv = glslc.addOutputFileArg(b.fmt("{s}.spv", .{name}));
-        exe_mod.addAnonymousImport(b.fmt("{s}.spv", .{name}), .{ .root_source_file = spv });
+        for ([_]*std.Build.Module{ exe_mod, eval_mod }) |m| m.addAnonymousImport(b.fmt("{s}.spv", .{name}), .{ .root_source_file = spv });
     }
 
     const exe = b.addExecutable(.{ .name = "codotaka", .root_module = exe_mod });
     b.installArtifact(exe);
+    b.installArtifact(b.addExecutable(.{ .name = "codotaka-eval", .root_module = eval_mod }));
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
