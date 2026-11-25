@@ -51,4 +51,5 @@ src/                        app: Renderer, player, demo, Flow (optical flow), ev
 shaders/                    GLSL (descriptor_heap, buffer_reference, compute)
 ```
 
-See `NOTES.md` for design decisions, current state and next steps.
+See `DOCUMENTATION.md` for how it works and why, `NOTES.md` for current state and next
+steps, and `STEERING.md` for how the project was directed.
