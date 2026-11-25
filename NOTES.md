@@ -70,10 +70,16 @@ Read this first when resuming work. User preferences and decisions are binding.
   accumulator element; video.frag falls back to the crossfade when < 25–50 % hold.
   300–330 s worst frame 14.51 → 16.02 dB (= crossfade), mean 28.99 dB; 60–90 s unchanged.
 
+- Experiments that did NOT pay off (reverted): in hard intervals 15–39 % of vectors are
+  ≥ 96 px, but a third (quarter-resolution) hint level changed nothing (31.88 / 29.00 dB),
+  and a 2×2 output grid gave +0.08 / +0.01 dB at ~2× optical-flow time. Conclusion:
+  motion estimation reach/resolution is not the bottleneck; the remaining error is in
+  synthesis (occlusions, motion blur, non-linear motion over 100 ms gaps).
+
 ## Next steps (in order)
-1. Large near-camera motion (bunny face): try 2×2 grid; check whether vectors hit the
-   search limit (FLOW_DUMP); consider 3-level hints. Full-res splatting matters on 4K
-   playback (eval runs at 1920 wide, roughly the estimation size).
+1. Synthesis quality on hard motion: learned refinement (coopmat2, RIFE-style), or
+   classical improvements (occlusion-aware hole filling, multi-hypothesis splats).
+   Full-res splatting still matters on 4K playback (eval runs at 1920 wide).
 2. Evaluate on more content than BBB (live action, 24/30 fps sources with step 2–3).
 3. Learned refinement: RTX 3050 has VK_NV_cooperative_matrix2 (reductions, per-element
    ops, conversions, bf16) — a small RIFE-style network in our own compute shaders.
