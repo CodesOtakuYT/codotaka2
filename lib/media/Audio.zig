@@ -62,7 +62,9 @@ pub const Ring = struct {
     /// Producer: writes as many whole frames as fit; returns frames written.
     pub fn write(self: *Ring, interleaved: []const f32) usize {
         const w = self.write_pos.load(.monotonic);
-        const r = self.read_pos.load(.acquire);
+        // Discarded frames (previous segment) count as free even if the reader is paused,
+        // otherwise a seek while audio is held could leave the writer blocked forever.
+        const r = @max(self.read_pos.load(.acquire), self.discard_before.load(.acquire));
         const free = self.capacity - (w - r);
         const n: u64 = @min(free, interleaved.len / channels);
         for (0..n) |i| {

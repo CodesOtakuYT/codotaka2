@@ -292,6 +292,7 @@ fn demuxLoop(self: *Decoder) anyerror!void {
             // Restart seamlessly: keep timestamps increasing across loops. (Audio keeps
             // counting samples, so its clock stays continuous too.)
             loop_offset_ns = video_end_ns;
+            audio_skip_before = -1; // a seek target applies to its own pass only
             try self.packets.putOne(self.io, .{ .end = loop_offset_ns });
             try HwDevice.check(c.av_seek_frame(self.fmt, self.stream.index, 0, c.AVSEEK_FLAG_BACKWARD), "av_seek_frame");
             continue;
