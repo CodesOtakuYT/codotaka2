@@ -1,15 +1,19 @@
 //! Motion estimation between consecutive video frames on NVIDIA's optical flow accelerator
 //! (VK_NV_optical_flow), used for motion-compensated frame interpolation.
 //!
-//! Two estimation slots (own session, vectors and cost) let the pair after the current one
-//! be estimated ahead, so vectors are ready by the time a pair is shown.
+//! Per frame pair (A shown, B next), the graphics queue renders both frames' luma at the
+//! estimation size and at half of it. The optical-flow queue then runs:
+//!   1. a coarse pass at half resolution (forward only). Its 4×4-grid vectors line up 1:1
+//!      with the full pass's 8×8 hint grid, so the coarse field is bound directly as hints:
+//!      the full pass searches around them, which roughly doubles the reachable motion;
+//!   2. the full pass: bidirectional 4×4-grid vectors, costs and a global (camera) vector.
+//! Results are copied into one of two slots (integer formats, read by shaders), so the
+//! pair after the shown one can be estimated ahead. One session per pass sees every pair
+//! in order, so the accelerator's temporal hints come from the previous pair.
 //!
-//! Per frame pair (A shown, B next): the graphics queue renders both frames' luma into
-//! `luma[ref]` / `luma[input]` (downscaled), then the optical-flow queue estimates one
-//! vector per 4×4 block from B (input) to A (reference), plus a matching cost. All images
-//! are CONCURRENT between the two families and stay in GENERAL; ordering is one timeline
-//! semaphore: graphics signals `2n+1`, optical flow waits on it and signals `2n+2`, and
-//! the draws that sample the vectors wait on `2n+2`.
+//! All images are CONCURRENT between the two families and stay in GENERAL; ordering is one
+//! timeline semaphore: graphics signals `2n+1`, optical flow waits on it and signals
+//! `2n+2`, and draws that sample a slot wait on its `ready` value.
 const Flow = @This();
 
 const std = @import("std");
@@ -27,23 +31,20 @@ const max_width = 1920;
 pub const luma_format: vk.Format = .r8_unorm;
 pub const vector_format: vk.Format = .r16g16_sfixed5_nv;
 /// Shaders read copies of the vectors in a plain integer format (S10.5 values, /32 in the
-/// shader), so how drivers convert SFIXED5 on sampling does not matter.
+/// shader): sampling SFIXED5 directly returns unscaled values on NVIDIA.
 const sampled_vector_format: vk.Format = .r16g16_sint;
 const cost_format: vk.Format = .r8_uint;
 
 pub const ref = 0;
 pub const input = 1;
 
+/// Shader-readable results of one estimation.
 pub const Slot = struct {
-    session: vk.OpticalFlowSessionNV = .null,
-    /// Forward: B (input) -> A (reference); backward: A -> B, for consistency checks.
+    /// Forward B (input) -> A (reference), backward A -> B, forward cost, global vector.
     vectors: Target = .{},
-    cost: Target = .{},
     back_vectors: Target = .{},
-    back_cost: Target = .{},
-    /// Integer copies of `vectors` / `back_vectors`, sampled by shaders.
-    vectors_int: Target = .{},
-    back_vectors_int: Target = .{},
+    cost: Target = .{},
+    global: Target = .{},
     cmd: vk.CommandBuffer = undefined,
     /// Frame pair (pts of A, B) estimated into this slot, and when it is ready.
     key: [2]i64 = .{ -1, -1 },
@@ -55,21 +56,33 @@ pub const Target = struct {
     memory: vk.DeviceMemory = .null,
     /// For optical flow bindings and rendering.
     view: vk.ImageView = .null,
-    /// For sampling (vectors/cost), through the descriptor heap.
+    /// For sampling, through the descriptor heap.
     slot: ?vk_core.DescriptorHeaps.ImageSlot = null,
 };
 
 device: *vk_core.Device,
 heaps: *vk_core.DescriptorHeaps,
-/// Estimation size (pixels) and the vector grid size (blocks).
+/// Estimation size (pixels); the coarse pass runs at half of it.
 width: u32,
 height: u32,
 luma: [2]Target,
+coarse_luma: [2]Target,
 /// Sampled views of the luma images (debug display).
 luma_slot: [2]vk_core.DescriptorHeaps.ImageSlot = undefined,
+coarse_session: vk.OpticalFlowSessionNV = .null,
+session: vk.OpticalFlowSessionNV = .null,
+/// Coarse vectors, copied into `hints` (an image cannot be both output and hint).
+coarse_vectors: Target = .{},
+hints: Target = .{},
+/// Full-pass outputs, copied into a slot after each run.
+out_vectors: Target = .{},
+out_back_vectors: Target = .{},
+out_cost: Target = .{},
+out_back_cost: Target = .{},
+out_global: Target = .{},
 slots: [2]Slot,
-pool: vk.CommandPool,
-sem: vk.Semaphore,
+pool: vk.CommandPool = .null,
+sem: vk.Semaphore = .null,
 /// Last value signalled (or to be signalled) on `sem`.
 value: u64 = 0,
 /// Images still need their first transition to GENERAL.
@@ -79,7 +92,8 @@ pub fn supported(device: *const vk_core.Device) bool {
     return device.flow_queue != null;
 }
 
-/// Estimation size for a video of `w`×`h`, inside the accelerator's limits.
+/// Estimation size for a video of `w`×`h`, inside the accelerator's limits; a multiple of
+/// 16 so the coarse grid and the hint grid line up exactly.
 pub fn sizeFor(device: *const vk_core.Device, w: u32, h: u32) [2]u32 {
     const p = device.flow_props.?;
     const limit = @min(max_width, p.max_width);
@@ -89,17 +103,26 @@ pub fn sizeFor(device: *const vk_core.Device, w: u32, h: u32) [2]u32 {
         fh = p.max_height;
         fw = @intCast(@as(u64, w) * fh / h);
     }
-    return .{ @max(p.min_width, fw & ~@as(u32, 3)), @max(p.min_height, fh & ~@as(u32, 3)) };
+    const min = 2 * @max(p.min_width, p.min_height);
+    return .{ @max(min, fw & ~@as(u32, 15)), @max(min, fh & ~@as(u32, 15)) };
+}
+
+pub fn gridSize(self: *const Flow) [2]u32 {
+    return .{ self.width / grid, self.height / grid };
 }
 
 pub fn create(gpa: std.mem.Allocator, device: *vk_core.Device, heaps: *vk_core.DescriptorHeaps, width: u32, height: u32) !*Flow {
     const dev = device.proxy;
     const props = device.flow_props.?;
     if (!props.supported_output_grid_sizes.@"4x4_nv") return error.OpticalFlowGridUnsupported;
+    if (!props.supported_hint_grid_sizes.@"8x8_nv" or props.hint_supported != .true) return error.OpticalFlowHintUnsupported;
     if (props.cost_supported != .true) return error.OpticalFlowCostUnsupported;
     if (props.bidirectional_flow_supported != .true) return error.OpticalFlowBidirectionalUnsupported;
+    if (props.global_flow_supported != .true) return error.OpticalFlowGlobalUnsupported;
     try checkFormat(device, .{ .input_nv = true }, luma_format);
     try checkFormat(device, .{ .output_nv = true }, vector_format);
+    try checkFormat(device, .{ .hint_nv = true }, vector_format);
+    try checkFormat(device, .{ .global_flow_nv = true }, vector_format);
     try checkFormat(device, .{ .cost_nv = true }, cost_format);
 
     const self = try gpa.create(Flow);
@@ -110,125 +133,125 @@ pub fn create(gpa: std.mem.Allocator, device: *vk_core.Device, heaps: *vk_core.D
         .width = width,
         .height = height,
         .luma = .{ .{}, .{} },
+        .coarse_luma = .{ .{}, .{} },
         .slots = .{ .{}, .{} },
-        .pool = .null,
-        .sem = .null,
     };
     errdefer self.destroyResources();
 
     const families = [_]u32{ device.queue_family, device.flow_family.? };
-    for (&self.luma, &self.luma_slot) |*l, *slot| {
-        l.* = try makeTarget(device, &families, .{ .input_nv = true }, luma_format, &.{}, .{ .color_attachment = true, .sampled = true }, width, height);
+    const g = self.gridSize();
+    for (&self.luma, &self.coarse_luma, &self.luma_slot) |*l, *cl, *slot| {
+        l.* = try makeTarget(device, &families, .{ .input_nv = true }, luma_format, .{ .color_attachment = true, .sampled = true }, width, height);
+        cl.* = try makeTarget(device, &families, .{ .input_nv = true }, luma_format, .{ .color_attachment = true }, width / 2, height / 2);
         slot.* = try heaps.addImageView(viewInfo(l.image, luma_format));
     }
-    const gw = (width + grid - 1) / grid;
-    const gh = (height + grid - 1) / grid;
-    self.pool = try dev.createCommandPool(&.{ .queue_family_index = device.flow_family.? }, null);
+    const out: vk.ImageUsageFlags = .{ .transfer_src = true, .sampled = true, .host_transfer = true };
+    self.coarse_vectors = try makeTarget(device, &families, .{ .output_nv = true }, vector_format, .{ .transfer_src = true, .sampled = true }, g[0] / 2, g[1] / 2);
+    self.hints = try makeTarget(device, &families, .{ .hint_nv = true }, vector_format, .{ .transfer_dst = true, .sampled = true }, g[0] / 2, g[1] / 2);
+    self.out_vectors = try makeTarget(device, &families, .{ .output_nv = true }, vector_format, out, g[0], g[1]);
+    self.out_back_vectors = try makeTarget(device, &families, .{ .output_nv = true }, vector_format, out, g[0], g[1]);
+    self.out_cost = try makeTarget(device, &families, .{ .cost_nv = true }, cost_format, out, g[0], g[1]);
+    self.out_back_cost = try makeTarget(device, &families, .{ .cost_nv = true }, cost_format, out, g[0], g[1]);
+    self.out_global = try makeTarget(device, &families, .{ .global_flow_nv = true }, vector_format, out, 1, 1);
+
+    const copy_dst: vk.ImageUsageFlags = .{ .transfer_dst = true, .sampled = true };
     for (&self.slots) |*s| {
-        // SFIXED5 is directly sampleable: reads return pixels as floats.
-        for ([_]*Target{ &s.vectors, &s.back_vectors }, [_]*Target{ &s.vectors_int, &s.back_vectors_int }) |t, ti| {
-            t.* = try makeTarget(device, &families, .{ .output_nv = true }, vector_format, &.{}, .{ .transfer_src = true, .sampled = true, .host_transfer = true }, gw, gh);
-            ti.* = try makeTarget(device, &families, null, sampled_vector_format, &.{}, .{ .transfer_dst = true, .sampled = true }, gw, gh);
-            ti.slot = try heaps.addImageView(viewInfo(ti.image, sampled_vector_format));
-        }
-        for ([_]*Target{ &s.cost, &s.back_cost }) |t| {
-            t.* = try makeTarget(device, &families, .{ .cost_nv = true }, cost_format, &.{}, .{ .sampled = true }, gw, gh);
-            t.slot = try heaps.addImageView(viewInfo(t.image, cost_format));
-        }
-        try self.initSession(s);
+        s.vectors = try makeTarget(device, &families, null, sampled_vector_format, copy_dst, g[0], g[1]);
+        s.back_vectors = try makeTarget(device, &families, null, sampled_vector_format, copy_dst, g[0], g[1]);
+        s.cost = try makeTarget(device, &families, null, cost_format, copy_dst, g[0], g[1]);
+        s.global = try makeTarget(device, &families, null, sampled_vector_format, copy_dst, 1, 1);
+        for ([_]*Target{ &s.vectors, &s.back_vectors, &s.cost, &s.global }) |t| t.slot = try heaps.addImageView(viewInfo(t.image, if (t == &s.cost) cost_format else sampled_vector_format));
     }
 
-    const type_info: vk.SemaphoreTypeCreateInfo = .{ .semaphore_type = .timeline, .initial_value = 0 };
-    self.sem = try dev.createSemaphore(&.{ .p_next = &type_info }, null);
-    log.info("optical flow {d}x{d} -> {d}x{d} vectors (4x4 grid, cost, bidirectional, 2 slots)", .{ width, height, gw, gh });
-    return self;
-}
+    // Coarse pass: half resolution, forward vectors only (the full pass's hints).
+    self.coarse_session = try dev.createOpticalFlowSessionNV(&.{
+        .width = width / 2,
+        .height = height / 2,
+        .image_format = luma_format,
+        .flow_vector_format = vector_format,
+        .cost_format = .undefined,
+        .output_grid_size = .{ .@"4x4_nv" = true },
+        .performance_level = .medium_nv,
+    }, null);
+    try dev.bindOpticalFlowSessionImageNV(self.coarse_session, .input_nv, self.coarse_luma[input].view, .general);
+    try dev.bindOpticalFlowSessionImageNV(self.coarse_session, .reference_nv, self.coarse_luma[ref].view, .general);
+    try dev.bindOpticalFlowSessionImageNV(self.coarse_session, .flow_vector_nv, self.coarse_vectors.view, .general);
 
-fn initSession(self: *Flow, s: *Slot) !void {
-    const dev = self.device.proxy;
-    s.session = try dev.createOpticalFlowSessionNV(&.{
-        .width = self.width,
-        .height = self.height,
+    // Full pass: hinted, bidirectional, with costs and the global vector.
+    self.session = try dev.createOpticalFlowSessionNV(&.{
+        .width = width,
+        .height = height,
         .image_format = luma_format,
         .flow_vector_format = vector_format,
         .cost_format = cost_format,
         .output_grid_size = .{ .@"4x4_nv" = true },
-        .performance_level = .medium_nv,
-        .flags = .{ .enable_cost_nv = true, .both_directions_nv = true },
+        .hint_grid_size = .{ .@"8x8_nv" = true },
+        .performance_level = .slow_nv,
+        .flags = .{ .enable_hint_nv = true, .enable_cost_nv = true, .both_directions_nv = true, .enable_global_flow_nv = true },
     }, null);
-    try dev.bindOpticalFlowSessionImageNV(s.session, .input_nv, self.luma[input].view, .general);
-    try dev.bindOpticalFlowSessionImageNV(s.session, .reference_nv, self.luma[ref].view, .general);
-    try dev.bindOpticalFlowSessionImageNV(s.session, .flow_vector_nv, s.vectors.view, .general);
-    try dev.bindOpticalFlowSessionImageNV(s.session, .cost_nv, s.cost.view, .general);
-    try dev.bindOpticalFlowSessionImageNV(s.session, .backward_flow_vector_nv, s.back_vectors.view, .general);
-    try dev.bindOpticalFlowSessionImageNV(s.session, .backward_cost_nv, s.back_cost.view, .general);
+    const bindings = [_]struct { vk.OpticalFlowSessionBindingPointNV, vk.ImageView }{
+        .{ .input_nv, self.luma[input].view },
+        .{ .reference_nv, self.luma[ref].view },
+        .{ .hint_nv, self.hints.view },
+        .{ .flow_vector_nv, self.out_vectors.view },
+        .{ .backward_flow_vector_nv, self.out_back_vectors.view },
+        .{ .cost_nv, self.out_cost.view },
+        .{ .backward_cost_nv, self.out_back_cost.view },
+        .{ .global_flow_nv, self.out_global.view },
+    };
+    for (bindings) |b| try dev.bindOpticalFlowSessionImageNV(self.session, b[0], b[1], .general);
 
-    // The execution never changes (fixed bindings), so it is recorded once and resubmitted.
+    // Both passes and the copy into a slot never change, so they are recorded once per
+    // slot and resubmitted.
+    self.pool = try dev.createCommandPool(&.{ .queue_family_index = device.flow_family.? }, null);
+    for (&self.slots) |*s| try self.record(s);
+
+    const type_info: vk.SemaphoreTypeCreateInfo = .{ .semaphore_type = .timeline, .initial_value = 0 };
+    self.sem = try dev.createSemaphore(&.{ .p_next = &type_info }, null);
+    log.info("optical flow {d}x{d} (hinted by {d}x{d}) -> {d}x{d} vectors (4x4 grid, bidirectional, cost, global)", .{ width, height, width / 2, height / 2, g[0], g[1] });
+    return self;
+}
+
+fn record(self: *Flow, s: *Slot) !void {
+    const dev = self.device.proxy;
     var cmd: [1]vk.CommandBuffer = undefined;
     try dev.allocateCommandBuffers(&.{ .command_pool = self.pool, .level = .primary, .command_buffer_count = 1 }, &cmd);
     s.cmd = cmd[0];
     const c = vk.CommandBufferProxy.init(s.cmd, dev.wrapper);
     try c.beginCommandBuffer(&.{ .flags = .{ .simultaneous_use = true } });
-    c.opticalFlowExecuteNV(s.session, &.{});
-    const gw = (self.width + grid - 1) / grid;
-    const gh = (self.height + grid - 1) / grid;
-    const mb = [_]vk.MemoryBarrier2{.{
-        .src_stage_mask = .{ .optical_flow_nv = true },
-        .src_access_mask = .{ .optical_flow_write_nv = true },
-        .dst_stage_mask = .{ .copy = true },
-        .dst_access_mask = .{ .transfer_read = true },
-    }};
-    c.pipelineBarrier2(&.{ .memory_barrier_count = mb.len, .p_memory_barriers = &mb });
     const layers: vk.ImageSubresourceLayers = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 };
-    for ([_]*const Target{ &s.vectors, &s.back_vectors }, [_]*const Target{ &s.vectors_int, &s.back_vectors_int }) |src, dst| {
-        c.copyImage(src.image, .general, dst.image, .general, &.{.{
-            .src_subresource = layers,
-            .src_offset = .{ .x = 0, .y = 0, .z = 0 },
-            .dst_subresource = layers,
-            .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
-            .extent = .{ .width = gw, .height = gh, .depth = 1 },
-        }});
-    }
+    const g = self.gridSize();
+    c.opticalFlowExecuteNV(self.coarse_session, &.{});
+    memoryBarrier(c, .{ .optical_flow_nv = true }, .{ .optical_flow_write_nv = true }, .{ .copy = true }, .{ .transfer_read = true });
+    c.copyImage(self.coarse_vectors.image, .general, self.hints.image, .general, &.{.{
+        .src_subresource = layers,
+        .src_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .dst_subresource = layers,
+        .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .extent = .{ .width = g[0] / 2, .height = g[1] / 2, .depth = 1 },
+    }});
+    memoryBarrier(c, .{ .copy = true }, .{ .transfer_write = true }, .{ .optical_flow_nv = true }, .{ .optical_flow_read_nv = true });
+    c.opticalFlowExecuteNV(self.session, &.{});
+    memoryBarrier(c, .{ .optical_flow_nv = true }, .{ .optical_flow_write_nv = true }, .{ .copy = true }, .{ .transfer_read = true });
+    const copies = [_]struct { *const Target, *const Target, [2]u32 }{
+        .{ &self.out_vectors, &s.vectors, g },
+        .{ &self.out_back_vectors, &s.back_vectors, g },
+        .{ &self.out_cost, &s.cost, g },
+        .{ &self.out_global, &s.global, .{ 1, 1 } },
+    };
+    for (copies) |cp| c.copyImage(cp[0].image, .general, cp[1].image, .general, &.{.{
+        .src_subresource = layers,
+        .src_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .dst_subresource = layers,
+        .dst_offset = .{ .x = 0, .y = 0, .z = 0 },
+        .extent = .{ .width = cp[2][0], .height = cp[2][1], .depth = 1 },
+    }});
     try c.endCommandBuffer();
 }
 
-/// Debug: waits for `s` and logs statistics of its raw forward vectors (int16 S10.5).
-pub fn dumpStats(self: *Flow, s: *const Slot) void {
-    const dev = self.device.proxy;
-    _ = dev.waitSemaphores(&.{ .semaphore_count = 1, .p_semaphores = &.{self.sem}, .p_values = &.{s.ready} }, std.math.maxInt(u64)) catch return;
-    const gw = (self.width + grid - 1) / grid;
-    const gh = (self.height + grid - 1) / grid;
-    const buf = std.heap.page_allocator.alloc([2]i16, gw * gh) catch return;
-    defer std.heap.page_allocator.free(buf);
-    dev.copyImageToMemory(&.{
-        .src_image = s.vectors.image,
-        .src_image_layout = .general,
-        .region_count = 1,
-        .p_regions = &.{.{
-            .p_host_pointer = buf.ptr,
-            .memory_row_length = 0,
-            .memory_image_height = 0,
-            .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
-            .image_offset = .{ .x = 0, .y = 0, .z = 0 },
-            .image_extent = .{ .width = gw, .height = gh, .depth = 1 },
-        }},
-    }) catch |err| {
-        log.err("dump: {t}", .{err});
-        return;
-    };
-    var max: i32 = 0;
-    var sum: f64 = 0;
-    var zero: usize = 0;
-    for (buf) |v| {
-        const m = @max(@abs(@as(i32, v[0])), @abs(@as(i32, v[1])));
-        max = @max(max, @as(i32, @intCast(m)));
-        sum += @floatFromInt(m);
-        if (m == 0) zero += 1;
-    }
-    const c = buf[(gh / 2) * gw + gw / 2];
-    log.info("vectors raw: max |v| {d} ({d:.1} px), mean {d:.2} px, {d}% zero, center ({d}, {d})", .{
-        max, @as(f64, @floatFromInt(max)) / 32.0, sum / @as(f64, @floatFromInt(buf.len)) / 32.0, zero * 100 / buf.len, c[0], c[1],
-    });
+fn memoryBarrier(c: vk.CommandBufferProxy, src_stage: vk.PipelineStageFlags2, src_access: vk.AccessFlags2, dst_stage: vk.PipelineStageFlags2, dst_access: vk.AccessFlags2) void {
+    const mb = [_]vk.MemoryBarrier2{.{ .src_stage_mask = src_stage, .src_access_mask = src_access, .dst_stage_mask = dst_stage, .dst_access_mask = dst_access }};
+    c.pipelineBarrier2(&.{ .memory_barrier_count = mb.len, .p_memory_barriers = &mb });
 }
 
 /// The slot holding vectors for `key`, if estimated (or being estimated).
@@ -243,19 +266,20 @@ pub fn destroy(self: *Flow, gpa: std.mem.Allocator) void {
     gpa.destroy(self);
 }
 
+fn targets(self: *Flow) [4 + 7 + 4 * 2]*Target {
+    var t: [4 + 7 + 4 * 2]*Target = undefined;
+    t[0..11].* = .{ &self.luma[0], &self.luma[1], &self.coarse_luma[0], &self.coarse_luma[1], &self.coarse_vectors, &self.hints, &self.out_vectors, &self.out_back_vectors, &self.out_cost, &self.out_back_cost, &self.out_global };
+    for (&self.slots, 0..) |*s, i| t[11 + 4 * i ..][0..4].* = .{ &s.vectors, &s.back_vectors, &s.cost, &s.global };
+    return t;
+}
+
 fn destroyResources(self: *Flow) void {
     const dev = self.device.proxy;
     dev.destroySemaphore(self.sem, null);
     dev.destroyCommandPool(self.pool, null);
-    for (&self.slots) |*s| dev.destroyOpticalFlowSessionNV(s.session, null);
-    for (self.luma_slot) |slot| self.heaps.removeImage(slot);
-    var targets: [2 + 6 * 2]*Target = undefined;
-    targets[0] = &self.luma[0];
-    targets[1] = &self.luma[1];
-    for (&self.slots, 0..) |*s, i| {
-        targets[2 + 6 * i ..][0..6].* = .{ &s.vectors, &s.cost, &s.back_vectors, &s.back_cost, &s.vectors_int, &s.back_vectors_int };
-    }
-    for (targets) |t| {
+    dev.destroyOpticalFlowSessionNV(self.session, null);
+    dev.destroyOpticalFlowSessionNV(self.coarse_session, null);
+    for (self.targets()) |t| {
         if (t.slot) |s| self.heaps.removeImage(s);
         dev.destroyImageView(t.view, null);
         dev.destroyImage(t.image, null);
@@ -267,15 +291,10 @@ fn destroyResources(self: *Flow) void {
 pub fn initLayouts(self: *Flow, cmd: vk.CommandBufferProxy) void {
     if (!self.fresh) return;
     self.fresh = false;
-    var images: [2 + 6 * 2]vk.Image = undefined;
-    images[0] = self.luma[0].image;
-    images[1] = self.luma[1].image;
-    for (&self.slots, 0..) |*s, i| {
-        images[2 + 6 * i ..][0..6].* = .{ s.vectors.image, s.cost.image, s.back_vectors.image, s.back_cost.image, s.vectors_int.image, s.back_vectors_int.image };
-    }
-    for (images) |img| {
+    for (self.targets()) |t| {
+        if (t.image == .null) continue;
         vk_core.barrier.image(cmd, .{
-            .image = img,
+            .image = t.image,
             .old_layout = .undefined,
             .new_layout = .general,
             .dst_stage = .{ .all_commands = true },
@@ -285,13 +304,13 @@ pub fn initLayouts(self: *Flow, cmd: vk.CommandBufferProxy) void {
 }
 
 /// Reserves the semaphore values of one estimation: graphics signals `.luma_done` after
-/// writing the luma images; `.flow_done` is reached when the vectors are ready.
+/// writing the luma images; `.flow_done` is reached when the slot is filled.
 pub fn reserve(self: *Flow) struct { luma_done: u64, flow_done: u64 } {
     self.value += 2;
     return .{ .luma_done = self.value - 1, .flow_done = self.value };
 }
 
-/// Queues the estimation (after the graphics submission that signals `luma_done`).
+/// Queues the estimation into `s` (after the graphics submission that signals `luma_done`).
 pub fn execute(self: *Flow, s: *const Slot, luma_done: u64) !void {
     const q = self.device.flow_queue.?;
     try q.submit2(&.{.{
@@ -302,6 +321,48 @@ pub fn execute(self: *Flow, s: *const Slot, luma_done: u64) !void {
         .signal_semaphore_info_count = 1,
         .p_signal_semaphore_infos = &.{.{ .semaphore = self.sem, .value = luma_done + 1, .stage_mask = .{ .all_commands = true }, .device_index = 0 }},
     }}, .null);
+}
+
+/// Debug: waits for `s` and logs statistics of the full pass's raw forward vectors
+/// (int16 S10.5) and the global vector, plus how long the estimation took.
+pub fn dumpStats(self: *Flow, s: *const Slot) void {
+    const dev = self.device.proxy;
+    _ = dev.waitSemaphores(&.{ .semaphore_count = 1, .p_semaphores = &.{self.sem}, .p_values = &.{s.ready} }, std.math.maxInt(u64)) catch return;
+    const g = self.gridSize();
+    const buf = std.heap.page_allocator.alloc([2]i16, g[0] * g[1]) catch return;
+    defer std.heap.page_allocator.free(buf);
+    var global: [2]i16 = undefined;
+    for ([_]struct { *const Target, *anyopaque, [2]u32 }{ .{ &self.out_vectors, buf.ptr, g }, .{ &self.out_global, &global, .{ 1, 1 } } }) |r| {
+        dev.copyImageToMemory(&.{
+            .src_image = r[0].image,
+            .src_image_layout = .general,
+            .region_count = 1,
+            .p_regions = &.{.{
+                .p_host_pointer = r[1],
+                .memory_row_length = 0,
+                .memory_image_height = 0,
+                .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
+                .image_offset = .{ .x = 0, .y = 0, .z = 0 },
+                .image_extent = .{ .width = r[2][0], .height = r[2][1], .depth = 1 },
+            }},
+        }) catch |err| {
+            log.err("dump: {t}", .{err});
+            return;
+        };
+    }
+    var max: i32 = 0;
+    var sum: f64 = 0;
+    for (buf) |v| {
+        const m: i32 = @intCast(@max(@abs(@as(i32, v[0])), @abs(@as(i32, v[1]))));
+        max = @max(max, m);
+        sum += @floatFromInt(m);
+    }
+    log.info("vectors: max {d:.1} px, mean {d:.2} px, global ({d:.1}, {d:.1}) px", .{
+        @as(f64, @floatFromInt(max)) / 32.0,
+        sum / @as(f64, @floatFromInt(buf.len)) / 32.0,
+        @as(f64, @floatFromInt(global[0])) / 32.0,
+        @as(f64, @floatFromInt(global[1])) / 32.0,
+    });
 }
 
 fn checkFormat(device: *vk_core.Device, usage: vk.OpticalFlowUsageFlagsNV, want: vk.Format) !void {
@@ -332,7 +393,6 @@ fn makeTarget(
     families: []const u32,
     of_usage: ?vk.OpticalFlowUsageFlagsNV,
     format: vk.Format,
-    view_formats: []const vk.Format,
     usage: vk.ImageUsageFlags,
     width: u32,
     height: u32,
@@ -344,18 +404,9 @@ fn makeTarget(
         dev.destroyImage(t.image, null);
         dev.freeMemory(t.memory, null);
     }
-    var formats_buf: [4]vk.Format = undefined;
-    formats_buf[0] = format;
-    @memcpy(formats_buf[1..][0..view_formats.len], view_formats);
-    const format_list: vk.ImageFormatListCreateInfo = .{ .view_format_count = @intCast(1 + view_formats.len), .p_view_formats = &formats_buf };
-    const list_next: ?*const anyopaque = if (view_formats.len > 0) &format_list else null;
-    const of_info: vk.OpticalFlowImageFormatInfoNV = .{
-        .p_next = @constCast(list_next),
-        .usage = of_usage orelse .{},
-    };
+    const of_info: vk.OpticalFlowImageFormatInfoNV = .{ .usage = of_usage orelse .{} };
     t.image = try dev.createImage(&.{
-        .p_next = if (of_usage != null) &of_info else list_next,
-        .flags = .{ .mutable_format = view_formats.len > 0 },
+        .p_next = if (of_usage != null) &of_info else null,
         .image_type = .@"2d",
         .format = format,
         .extent = .{ .width = width, .height = height, .depth = 1 },

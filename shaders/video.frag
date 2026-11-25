@@ -29,7 +29,8 @@ layout(push_constant, scalar) uniform Push {
     vec2 flow_size;           // estimation size in pixels
     vec2 grid_size;           // vector image size in blocks
     uint debug_luma;          // estimation input (mode 3)
-    uint back_vectors;        // flow from A to B (consistency check)
+    uint back_vectors;        // flow from A to B
+    uint global_flow;         // one B -> A vector for the whole frame (camera motion)
 } pc;
 
 layout(location = 0) in vec2 v_uv;
@@ -115,9 +116,30 @@ vec2 flowAt(uint field, vec2 p) {
                mix(vectorAt(field, b0 + ivec2(0, 1)), vectorAt(field, b0 + ivec2(1, 1)), t.x), t.y);
 }
 
-float costAt(ivec2 b) {
-    b = clamp(b, ivec2(0), ivec2(pc.grid_size) - 1);
+float costAt(vec2 p) {
+    ivec2 b = clamp(ivec2(p / float(GRID)), ivec2(0), ivec2(pc.grid_size) - 1);
     return float(texelFetch(utextures[nonuniformEXT(pc.cost)], b, 0).r);
+}
+
+// Estimation pixels -> texture coordinates of the decoded frames.
+vec2 toUv(vec2 px) { return px / pc.flow_size * pc.uv_max; }
+
+vec3 frameA(vec2 px) { return shade(toUv(px), pc.luma, pc.chroma); }
+vec3 frameB(vec2 px) { return shade(toUv(px), pc.luma_b, pc.chroma_b); }
+
+float colorDiff(vec3 x, vec3 y) {
+    vec3 d = abs(x - y) / max(pc.white_scale, 1e-3);
+    return max(d.r, max(d.g, d.b));
+}
+
+// One motion hypothesis for the output pixel: where its content is in A and in B.
+struct Candidate { vec3 a, b; float weight; vec2 motion; };
+
+// How much a hypothesis is believed: both frames must show the same content there, and
+// it must explain them clearly better than no motion (flat areas produce noise vectors).
+float believe(vec3 a, vec3 b, float still_diff) {
+    float d = colorDiff(a, b);
+    return (1.0 - smoothstep(0.03, 0.10, d)) * smoothstep(0.005, 0.03, still_diff - d);
 }
 
 void main() {
@@ -131,44 +153,55 @@ void main() {
         out_color = encodeOutput(vec4(vec3(l), 1.0));
         return;
     }
-    // Vector field in estimation pixels, B -> A; going back A -> B from where it points
-    // must return to the start (forward-backward consistency).
-    vec2 px = uv / pc.uv_max * pc.flow_size;
-    vec2 f = flowAt(pc.vectors, px);
-    vec2 back = flowAt(pc.back_vectors, px + f);
-    float fb_error = length(f + back);
-    vec2 g = px / float(GRID) - 0.5;
-    ivec2 b0 = ivec2(floor(g));
-    float cost = max(max(costAt(b0), costAt(b0 + ivec2(1, 0))), max(costAt(b0 + ivec2(0, 1)), costAt(b0 + ivec2(1, 1))));
-    // A pixel at x on the in-between frame came from x + alpha*f in A and is going to
-    // x - (1 - alpha)*f in B (f evaluated at x approximates the vector along its path).
-    vec2 fuv = f / pc.flow_size * pc.uv_max;
-    vec3 a = shade(uv + pc.alpha * fuv, pc.luma, pc.chroma);
-    vec3 bc = shade(uv - (1.0 - pc.alpha) * fuv, pc.luma_b, pc.chroma_b);
-    vec3 warped = mix(a, bc, pc.alpha);
-    // A correct vector brings the same content from both frames; where the warped samples
-    // disagree (fades, occlusions, noise in flat areas) or the accelerator reports a high
-    // cost, fall back to a plain blend of the two frames at this pixel.
-    vec3 still_a = shade(uv, pc.luma, pc.chroma);
-    vec3 still_b = shade(uv, pc.luma_b, pc.chroma_b);
-    vec3 blend = mix(still_a, still_b, pc.alpha);
-    float inv_white = 1.0 / max(pc.white_scale, 1e-3);
-    vec3 d = abs(a - bc) * inv_white;
-    float mismatch = max(d.r, max(d.g, d.b));
-    // The vector must explain the two frames clearly better than standing still does
-    // (flat or unchanged areas get noise vectors that "match" just as well).
-    vec3 d0 = abs(still_a - still_b) * inv_white;
-    float still_mismatch = max(d0.r, max(d0.g, d0.b));
-    float trust = (1.0 - smoothstep(0.04, 0.12, mismatch)) * (1.0 - smoothstep(64.0, 200.0, cost))
-                * (1.0 - smoothstep(0.75, 2.5, fb_error))
-                * smoothstep(0.01, 0.04, still_mismatch - mismatch);
+    float t = pc.alpha;
+    vec2 x = uv / pc.uv_max * pc.flow_size;
+    vec3 still_a = frameA(x);
+    vec3 still_b = frameB(x);
+    float still_diff = colorDiff(still_a, still_b);
+
+    // Trajectory anchored in B: B's pixel xb (vector f: B -> A) is at xb + (1 - t) f at
+    // time t. Solve xb + (1 - t) F(xb) = x by fixed-point iteration (each frame uses its
+    // own field, so object edges don't borrow the neighbour's motion).
+    vec2 xb = x;
+    for (int i = 0; i < 4; i++) xb = x - (1.0 - t) * flowAt(pc.vectors, xb);
+    vec2 f = flowAt(pc.vectors, xb);
+    Candidate cb = Candidate(frameA(xb + f), frameB(xb), 0.0, -f);
+    float fb_b = length(f + flowAt(pc.back_vectors, xb + f));
+    cb.weight = believe(cb.a, cb.b, still_diff) * (1.0 - smoothstep(0.75, 2.5, fb_b))
+              * (1.0 - smoothstep(64.0, 200.0, costAt(xb)));
+
+    // Trajectory anchored in A (vector g: A -> B): xa + t G(xa) = x.
+    vec2 xa = x;
+    for (int i = 0; i < 4; i++) xa = x - t * flowAt(pc.back_vectors, xa);
+    vec2 g = flowAt(pc.back_vectors, xa);
+    Candidate ca = Candidate(frameA(xa), frameB(xa + g), 0.0, g);
+    float fb_a = length(g + flowAt(pc.vectors, xa + g));
+    ca.weight = believe(ca.a, ca.b, still_diff) * (1.0 - smoothstep(0.75, 2.5, fb_a));
+
+    // Camera motion, for areas where local vectors failed (e.g. motion beyond the search).
+    vec2 gf = vectorAt(pc.global_flow, ivec2(0));
+    vec2 xg = x - (1.0 - t) * gf;
+    Candidate cg = Candidate(frameA(xg + gf), frameB(xg), 0.0, -gf);
+    cg.weight = believe(cg.a, cg.b, still_diff) * (1.0 - max(cb.weight, ca.weight)) * 0.5;
+
+    // Unchanged content: the plain blend is exact.
+    float w_still = 1.0 - smoothstep(0.01, 0.04, still_diff);
+    // Occlusion (content visible in only one frame, no hypothesis holds): take it from one
+    // frame along that frame's own trajectory instead of ghosting both.
+    vec3 occluded = t < 0.5 ? ca.a : cb.b;
+    float w_occ = 0.02;
+
+    vec3 col = cb.weight * mix(cb.a, cb.b, t) + ca.weight * mix(ca.a, ca.b, t) + cg.weight * mix(cg.a, cg.b, t)
+             + w_still * mix(still_a, still_b, t) + w_occ * occluded;
+    float total = cb.weight + ca.weight + cg.weight + w_still + w_occ;
+
     if (pc.mode == 2u) {
-        // Vectors as used: direction as hue, magnitude as brightness; rejected ones dark.
-        vec2 fu = f * trust;
-        float mag = clamp(length(fu) / 8.0, 0.0, 1.0);
-        vec3 dir = 0.5 + 0.5 * vec3(fu.x, fu.y, -fu.x) / max(length(fu), 1e-3);
+        // Motion as used (B -> A direction): hue = direction, brightness = speed.
+        vec2 m = (cb.weight * cb.motion + ca.weight * ca.motion + cg.weight * cg.motion) / total;
+        float mag = clamp(length(m) / 8.0, 0.0, 1.0);
+        vec3 dir = 0.5 + 0.5 * vec3(m.x, m.y, -m.x) / max(length(m), 1e-3);
         out_color = encodeOutput(vec4(mix(still_a * 0.2, dir * pc.white_scale, mag), 1.0));
         return;
     }
-    out_color = encodeOutput(vec4(mix(blend, warped, trust), 1.0));
+    out_color = encodeOutput(vec4(col / total, 1.0));
 }

@@ -73,6 +73,7 @@ const VideoPush = extern struct {
     grid_size: [2]f32 = .{ 0, 0 },
     debug_luma: u32 = 0,
     back_vectors: u32 = 0,
+    global: u32 = 0,
 };
 
 const spv = struct {
@@ -322,10 +323,19 @@ fn estimate(self: *Renderer, cmd: vk.CommandBufferProxy, f: *Flow, a: *const med
     if (self.flow_luma_done != null) return; // one estimation per frame
     self.flow_stats.estimated += 1;
     f.initLayouts(cmd);
-    for ([2]*const media.Frame{ a, b }, [2]usize{ Flow.ref, Flow.input }) |src, which| {
+    // Full and half resolution luma of both frames (the half-size pair feeds the coarse pass).
+    const Pass = struct { src: *const media.Frame, target: *const Flow.Target, w: u32, h: u32 };
+    const passes = [_]Pass{
+        .{ .src = a, .target = &f.luma[Flow.ref], .w = f.width, .h = f.height },
+        .{ .src = b, .target = &f.luma[Flow.input], .w = f.width, .h = f.height },
+        .{ .src = a, .target = &f.coarse_luma[Flow.ref], .w = f.width / 2, .h = f.height / 2 },
+        .{ .src = b, .target = &f.coarse_luma[Flow.input], .w = f.width / 2, .h = f.height / 2 },
+    };
+    for (passes) |pass| {
+        const src = pass.src;
         const slots = try self.videoSlots(src);
         const attachment = [_]vk.RenderingAttachmentInfo{.{
-            .image_view = f.luma[which].view,
+            .image_view = pass.target.view,
             .image_layout = .general,
             .resolve_mode = .{},
             .resolve_image_layout = .undefined,
@@ -333,7 +343,7 @@ fn estimate(self: *Renderer, cmd: vk.CommandBufferProxy, f: *Flow, a: *const med
             .store_op = .store,
             .clear_value = undefined,
         }};
-        const extent: vk.Extent2D = .{ .width = f.width, .height = f.height };
+        const extent: vk.Extent2D = .{ .width = pass.w, .height = pass.h };
         cmd.beginRendering(&.{
             .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
             .layer_count = 1,
@@ -344,7 +354,7 @@ fn estimate(self: *Renderer, cmd: vk.CommandBufferProxy, f: *Flow, a: *const med
         vk_core.ShaderCache.setDefaultState(cmd);
         self.shaders.bind(cmd, self.ids.get(.luma), 0);
         vk_core.ShaderCache.setBlend(cmd, .none);
-        cmd.setViewportWithCount(&.{.{ .x = 0, .y = 0, .width = @floatFromInt(f.width), .height = @floatFromInt(f.height), .min_depth = 0, .max_depth = 1 }});
+        cmd.setViewportWithCount(&.{.{ .x = 0, .y = 0, .width = @floatFromInt(pass.w), .height = @floatFromInt(pass.h), .min_depth = 0, .max_depth = 1 }});
         cmd.setScissorWithCount(&.{.{ .offset = .{ .x = 0, .y = 0 }, .extent = extent }});
         var vp = std.mem.zeroes(VideoPush);
         vp.dst = .{ -1, -1, 1, 1 };
@@ -463,13 +473,14 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
                 vp.mode = @intFromEnum(vd.interpolation);
                 vp.luma_b = @intFromEnum(nslots[0]);
                 vp.chroma_b = @intFromEnum(nslots[1]);
-                vp.vectors = @intFromEnum(fs.vectors_int.slot.?);
+                vp.vectors = @intFromEnum(fs.vectors.slot.?);
+                vp.global = @intFromEnum(fs.global.slot.?);
                 vp.cost = @intFromEnum(fs.cost.slot.?);
                 vp.debug_luma = @intFromEnum(fl.luma_slot[Flow.input]);
-                vp.back_vectors = @intFromEnum(fs.back_vectors_int.slot.?);
+                vp.back_vectors = @intFromEnum(fs.back_vectors.slot.?);
                 vp.alpha = vd.alpha;
                 vp.flow_size = .{ @floatFromInt(fl.width), @floatFromInt(fl.height) };
-                vp.grid_size = .{ @floatFromInt((fl.width + Flow.grid - 1) / Flow.grid), @floatFromInt((fl.height + Flow.grid - 1) / Flow.grid) };
+                vp.grid_size = .{ @floatFromInt(fl.gridSize()[0]), @floatFromInt(fl.gridSize()[1]) };
             }
             @memcpy(push[0..@sizeOf(VideoPush)], std.mem.asBytes(&vp));
             push_len = @sizeOf(VideoPush);

@@ -15,6 +15,7 @@ layout(push_constant, scalar) uniform Push {
     vec2 flow_size, grid_size;
     uint debug_luma;
     uint back_vectors;
+    uint global_flow;
 } pc;
 
 layout(location = 0) out vec2 v_uv;
