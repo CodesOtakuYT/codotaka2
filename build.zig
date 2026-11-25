@@ -212,6 +212,7 @@ pub fn build(b: *std.Build) void {
         "shaders/rect.frag",
         "shaders/luma.frag",
         "shaders/splat.comp",
+        "shaders/metric.comp",
         "lib/csd/shaders/decoration.vert",
         "lib/csd/shaders/decoration.frag",
     };

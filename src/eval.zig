@@ -4,8 +4,12 @@
 //! input and interpolates the frames in between with the real renderer (same shaders, same
 //! optical flow path as the player). Each synthesized frame is compared with the real frame
 //! that was dropped, next to two baselines: repeating the nearest frame (what a player does
-//! without interpolation) and a plain crossfade. Scores are PSNR (dB) of gamma-encoded RGB,
-//! averaged over all synthesized frames, plus the worst frame.
+//! without interpolation) and a plain crossfade.
+//!
+//! Everything stays on the GPU: the candidates are rendered into offscreen images and a
+//! compute pass (shaders/metric.comp) sums their squared errors; the CPU reads 4 floats per
+//! synthesized frame, once per interval. Scores are PSNR of gamma-encoded RGB from the mean
+//! squared error over all frames, plus the worst frame.
 const std = @import("std");
 const vk = @import("vulkan");
 const vk_core = @import("vk_core");
@@ -59,7 +63,18 @@ fn toDb(e: f64) f64 {
 
 /// Intervals whose endpoints differ this much (PSNR) contain a scene cut: excluded, since
 /// no interpolation can recover a cut from its two sides.
-const cut_db = 18.0;
+const cut_db = 12.0;
+
+const metric_spv align(@alignOf(u32)) = @embedFile("metric.comp.spv").*;
+
+const MetricPush = extern struct {
+    out_sums: u64,
+    truth: u32,
+    a: u32,
+    b: u32,
+    ours: u32,
+    t: f32,
+};
 
 pub fn run(gpa: Allocator, io: Io, instance: *vk_core.Instance, candidate: vk_core.Instance.Candidate, opts: Options) !void {
     const device = try vk_core.Device.create(gpa, instance, candidate, .{ .extensions = &vk_present.device_extensions, .video_decode = true, .optical_flow = true });
@@ -79,10 +94,21 @@ pub fn run(gpa: Allocator, io: Io, instance: *vk_core.Instance, candidate: vk_co
     if (opts.start_s > 0) _ = decoder.seek(@intFromFloat(opts.start_s * std.time.ns_per_s));
     try decoder.start();
 
-    var ev: Eval = .{ .gpa = gpa, .io = io, .device = device, .renderer = renderer, .ring = &ring, .decoder = decoder, .opts = opts };
+    var ev: Eval = .{
+        .gpa = gpa,
+        .io = io,
+        .device = device,
+        .renderer = renderer,
+        .ring = &ring,
+        .decoder = decoder,
+        .opts = opts,
+        .metric = try renderer.shaders.registerCompute(&metric_spv),
+    };
     defer ev.deinit();
     try ev.run();
 }
+
+const Image = enum { truth, a, b, ours };
 
 const Eval = struct {
     gpa: Allocator,
@@ -92,22 +118,23 @@ const Eval = struct {
     ring: *vk_core.FrameRing,
     decoder: *media.Decoder,
     opts: Options,
-    target: vk_core.Image = .{},
-    /// CPU-cached copy of the target (filled by the GPU).
-    readback: vk_core.Buffer = .{},
+    metric: vk_core.ShaderCache.ComputeId,
     extent: vk.Extent2D = .{ .width = 0, .height = 0 },
-    pixels: [4][]f16 = .{ &.{}, &.{}, &.{}, &.{} },
+    images: std.EnumArray(Image, vk_core.Image) = .initFill(.{}),
+    slots: std.EnumArray(Image, vk_core.DescriptorHeaps.ImageSlot) = undefined,
+    /// 4 sums per synthesized frame of the current interval (host-cached, GPU atomics).
+    sums: vk_core.Buffer = .{},
     held: std.ArrayList(media.Frame) = .empty,
     scores: std.EnumArray(Method, Score) = .initFill(.{}),
     cuts: u32 = 0,
     static_frames: u32 = 0,
 
     fn deinit(self: *Eval) void {
+        self.device.waitIdle();
         for (self.held.items) |*f| f.release();
         self.held.deinit(self.gpa);
-        for (self.pixels) |p| self.gpa.free(p);
-        if (self.target.image != .null) self.target.deinit(self.device);
-        if (self.readback.buffer != .null) self.readback.deinit(self.device);
+        for (&self.images.values) |*img| if (img.image != .null) img.deinit(self.device);
+        if (self.sums.buffer != .null) self.sums.deinit(self.device);
     }
 
     /// Next decoded frame (of the current seek generation), or null at the end.
@@ -120,8 +147,8 @@ const Eval = struct {
                 buf[0].release();
                 continue;
             }
-            try self.io.sleep(.fromMilliseconds(2), .awake);
-            idle_ms += 2;
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+            idle_ms += 1;
         }
         return null;
     }
@@ -161,47 +188,59 @@ const Eval = struct {
         const w = @min(self.opts.width, sample.width());
         const h: u32 = @intCast(@as(u64, sample.height()) * w / sample.width());
         self.extent = .{ .width = w, .height = h };
-        self.target = try vk_core.Image.create(self.device, .{
-            .format = .r16g16b16a16_sfloat,
-            .extent = self.extent,
-            .usage = .{ .color_attachment = true, .transfer_src = true, .host_transfer = true },
-        });
-        try self.target.hostTransition(self.device, .undefined, .general);
-        self.readback = try vk_core.Buffer.create(self.device, .{
-            .size = @as(u64, w) * h * 8,
-            .usage = .{ .transfer_dst = true },
+        for (std.enums.values(Image)) |which| {
+            const img = self.images.getPtr(which);
+            img.* = try vk_core.Image.create(self.device, .{
+                .format = .r16g16b16a16_sfloat,
+                .extent = self.extent,
+                .usage = .{ .color_attachment = true, .sampled = true, .host_transfer = true },
+            });
+            try img.hostTransition(self.device, .undefined, .general);
+            self.slots.set(which, try self.renderer.heaps.addImage(img));
+        }
+        self.sums = try vk_core.Buffer.create(self.device, .{
+            .size = @as(u64, self.opts.step) * 4 * @sizeOf(f32),
+            .usage = .{ .storage_buffer = true, .transfer_dst = true, .shader_device_address = true },
             .readback = true,
         });
-        for (&self.pixels) |*p| p.* = try self.gpa.alloc(f16, @as(usize, w) * h * 4);
     }
 
     fn evalInterval(self: *Eval) !void {
         const step = self.opts.step;
         const a = &self.held.items[0];
         const b = &self.held.items[step];
-        // Estimate the pair's vectors (the first interpolated draw only queues them).
-        try self.render(.{ .frame = a, .next = b, .alpha = 0, .interpolation = .on }, null);
-        try self.render(.{ .frame = a }, self.pixels[1]);
-        try self.render(.{ .frame = b }, self.pixels[2]);
-        if (toDb(mse(self.pixels[1], self.pixels[2], null, 0)) < cut_db) {
+        @memset(self.sumsSlice(), 0);
+        try self.device.proxy.flushMappedMemoryRanges(&.{.{ .memory = self.sums.memory, .offset = 0, .size = vk.WHOLE_SIZE }});
+        // Queue the pair's vector estimation (usable by the next submission), and render
+        // both endpoints; nothing here waits for the GPU.
+        try self.render(.{ .frame = a, .next = b, .alpha = 0, .interpolation = .on }, .ours, null);
+        try self.render(.{ .frame = a }, .a, null);
+        try self.render(.{ .frame = b }, .b, null);
+        for (1..step) |k| {
+            const t: f32 = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(step));
+            try self.render(.{ .frame = &self.held.items[k] }, .truth, null);
+            try self.render(.{ .frame = a, .next = b, .alpha = t, .interpolation = .on }, .ours, .{ .k = @intCast(k), .t = t });
+        }
+        // One wait per interval, then 4 floats per synthesized frame.
+        try self.device.waitValue(self.device.lastValue());
+        try self.device.proxy.invalidateMappedMemoryRanges(&.{.{ .memory = self.sums.memory, .offset = 0, .size = vk.WHOLE_SIZE }});
+        const pixels: f64 = @floatFromInt(@as(u64, self.extent.width) * self.extent.height * 3);
+        const sums = self.sumsSlice();
+        if (toDb(sums[4 * 1 + 3] / pixels) < cut_db) {
             self.cuts += 1;
             return;
         }
         for (1..step) |k| {
-            const t: f32 = @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(step));
-            try self.render(.{ .frame = &self.held.items[k] }, self.pixels[0]);
-            const truth = self.pixels[0];
-            const near = mse(truth, if (t < 0.5) self.pixels[1] else self.pixels[2], null, 0);
-            if (near <= 1e-12) self.static_frames += 1;
-            self.scores.getPtr(.nearest).add(near);
-            self.scores.getPtr(.crossfade).add(mse(truth, self.pixels[1], self.pixels[2], t));
-            try self.render(.{ .frame = a, .next = b, .alpha = t, .interpolation = .on }, self.pixels[3]);
-            self.scores.getPtr(.interpolated).add(mse(truth, self.pixels[3], null, 0));
-            if (std.c.getenv("CODOTAKA_EVAL_DEBUG") != null) log.info("k={d} mean truth {d:.4} A {d:.4} B {d:.4} ours {d:.4} | psnr near {d:.2} ours {d:.2}", .{
-                k, meanOf(truth), meanOf(self.pixels[1]), meanOf(self.pixels[2]), meanOf(self.pixels[3]),
-                toDb(mse(truth, if (t < 0.5) self.pixels[1] else self.pixels[2], null, 0)), toDb(mse(truth, self.pixels[3], null, 0)),
-            });
+            const s = sums[4 * k ..][0..4];
+            if (s[0] <= 0) self.static_frames += 1;
+            self.scores.getPtr(.nearest).add(s[0] / pixels);
+            self.scores.getPtr(.crossfade).add(s[1] / pixels);
+            self.scores.getPtr(.interpolated).add(s[2] / pixels);
         }
+    }
+
+    fn sumsSlice(self: *Eval) []f32 {
+        return @as([*]f32, @ptrCast(@alignCast(self.sums.mapped.?)))[0 .. self.opts.step * 4];
     }
 
     const DrawSpec = struct {
@@ -211,9 +250,11 @@ const Eval = struct {
         interpolation: Renderer.Interpolation = .off,
     };
 
-    /// Renders one video draw into the target through the real renderer and, if `out` is
-    /// given, reads it back.
-    fn render(self: *Eval, spec: DrawSpec, out: ?[]f16) !void {
+    const Measure = struct { k: u32, t: f32 };
+
+    /// Renders one video draw into `into` through the real renderer; with `measure`, also
+    /// records the metric pass for synthesized frame k (in the same submission).
+    fn render(self: *Eval, spec: DrawSpec, into: Image, measure: ?Measure) !void {
         const vd: Renderer.VideoDraw = .{
             .frame = spec.frame,
             .dst = .{ -1, -1, 1, 1 },
@@ -234,87 +275,39 @@ const Eval = struct {
             .draw = d,
         }};
         const rec = self.renderer.recorder();
-        const f = (try self.ring.begin(try self.device.completedValue())) orelse blk: {
-            try self.device.waitValue(self.device.lastValue());
-            break :blk (try self.ring.begin(try self.device.completedValue())).?;
+        const f = while (true) {
+            if (try self.ring.begin(try self.device.completedValue())) |f| break f;
+            try self.device.waitValue((try self.device.completedValue()) + 1);
         };
         const cmd = f.commands(self.device);
         try rec.begin_frame(rec.ctx, cmd);
-        try rec.record(rec.ctx, cmd, &f.upload, .{ .view = self.target.view, .extent = self.extent, .format = self.target.format }, &views);
-        if (out != null) {
-            const b = [_]vk.MemoryBarrier2{.{
-                .src_stage_mask = .{ .color_attachment_output = true },
-                .src_access_mask = .{ .color_attachment_write = true },
-                .dst_stage_mask = .{ .copy = true },
-                .dst_access_mask = .{ .transfer_read = true },
-            }};
-            cmd.pipelineBarrier2(&.{ .memory_barrier_count = b.len, .p_memory_barriers = &b });
-            cmd.copyImageToBuffer(self.target.image, .general, self.readback.buffer, &.{.{
-                .buffer_offset = 0,
-                .buffer_row_length = 0,
-                .buffer_image_height = 0,
-                .image_subresource = .{ .aspect_mask = .{ .color = true }, .mip_level = 0, .base_array_layer = 0, .layer_count = 1 },
-                .image_offset = .{ .x = 0, .y = 0, .z = 0 },
-                .image_extent = .{ .width = self.extent.width, .height = self.extent.height, .depth = 1 },
-            }});
-            const to_host = [_]vk.MemoryBarrier2{.{
-                .src_stage_mask = .{ .copy = true },
-                .src_access_mask = .{ .transfer_write = true },
-                .dst_stage_mask = .{ .host = true },
-                .dst_access_mask = .{ .host_read = true },
-            }};
-            cmd.pipelineBarrier2(&.{ .memory_barrier_count = to_host.len, .p_memory_barriers = &to_host });
+        // Earlier submissions may still read this image (metric pass) or write it.
+        barrier(cmd, .{ .all_commands = true }, .{ .memory_read = true, .memory_write = true }, .{ .color_attachment_output = true }, .{ .color_attachment_write = true });
+        const target = self.images.getPtr(into);
+        try rec.record(rec.ctx, cmd, &f.upload, .{ .view = target.view, .extent = self.extent, .format = target.format }, &views);
+        if (measure) |m| {
+            barrier(cmd, .{ .color_attachment_output = true }, .{ .color_attachment_write = true }, .{ .compute_shader = true }, .{ .shader_sampled_read = true });
+            self.renderer.shaders.bindCompute(cmd, self.metric);
+            const push: MetricPush = .{
+                .out_sums = self.sums.address + @as(u64, m.k) * 4 * @sizeOf(f32),
+                .truth = @intFromEnum(self.slots.get(.truth)),
+                .a = @intFromEnum(self.slots.get(.a)),
+                .b = @intFromEnum(self.slots.get(.b)),
+                .ours = @intFromEnum(self.slots.get(.ours)),
+                .t = m.t,
+            };
+            cmd.pushDataEXT(&.{ .offset = 0, .data = .{ .address = &push, .size = @sizeOf(MetricPush) } });
+            cmd.dispatch((self.extent.width + 15) / 16, (self.extent.height + 15) / 16, 1);
+            barrier(cmd, .{ .compute_shader = true }, .{ .shader_storage_write = true }, .{ .host = true }, .{ .host_read = true });
         }
         var sync: vk_core.FrameRing.Sync = .{};
         try rec.end_frame(rec.ctx, &sync);
-        const value = try self.ring.submit(f, &sync);
+        _ = try self.ring.submit(f, &sync);
         rec.submitted(rec.ctx);
-        try self.device.waitValue(value);
-        if (out) |pixels| {
-            try self.device.proxy.invalidateMappedMemoryRanges(&.{.{ .memory = self.readback.memory, .offset = 0, .size = vk.WHOLE_SIZE }});
-            @memcpy(std.mem.sliceAsBytes(pixels), self.readback.mapped.?[0 .. pixels.len * 2]);
-        }
     }
 };
 
-/// Mean squared error of `test_a` (or of mix(test_a, test_b, t) when test_b is given)
-/// against `truth`, over gamma-2.2-encoded RGB in [0, 1].
-fn mse(truth: []const f16, test_a: []const f16, test_b: ?[]const f16, t: f32) f64 {
-    var se: f64 = 0;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < truth.len) : (i += 4) {
-        for (0..3) |c| {
-            var v: f32 = test_a[i + c];
-            if (test_b) |b| v = v * (1 - t) + @as(f32, b[i + c]) * t;
-            const d = encode(truth[i + c]) - encode(v);
-            se += d * d;
-            n += 1;
-        }
-    }
-    return se / @as(f64, @floatFromInt(n));
-}
-
-/// Gamma 2.2 encoding of every f16 value (bit pattern -> encoded), built once.
-var encode_table: [65536]f32 = undefined;
-var encode_table_ready = false;
-
-fn encode(x: anytype) f64 {
-    if (!encode_table_ready) {
-        for (&encode_table, 0..) |*e, bits| {
-            const v: f16 = @bitCast(@as(u16, @intCast(bits)));
-            const f: f64 = @floatCast(v);
-            e.* = if (std.math.isNan(f)) 0 else @floatCast(std.math.pow(f64, std.math.clamp(f, 0, 1), 1.0 / 2.2));
-        }
-        encode_table_ready = true;
-    }
-    const h: f16 = @floatCast(x);
-    return encode_table[@as(u16, @bitCast(h))];
-}
-
-fn meanOf(px: []const f16) f64 {
-    var sum: f64 = 0;
-    var i: usize = 0;
-    while (i < px.len) : (i += 4) sum += @floatCast(px[i + 1]);
-    return sum / @as(f64, @floatFromInt(px.len / 4));
+fn barrier(cmd: vk.CommandBufferProxy, src_stage: vk.PipelineStageFlags2, src_access: vk.AccessFlags2, dst_stage: vk.PipelineStageFlags2, dst_access: vk.AccessFlags2) void {
+    const b = [_]vk.MemoryBarrier2{.{ .src_stage_mask = src_stage, .src_access_mask = src_access, .dst_stage_mask = dst_stage, .dst_access_mask = dst_access }};
+    cmd.pipelineBarrier2(&.{ .memory_barrier_count = b.len, .p_memory_barriers = &b });
 }

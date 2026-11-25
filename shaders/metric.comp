@@ -1,0 +1,53 @@
+#version 460
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_atomic_float : require
+
+// Interpolation quality: squared errors (gamma-encoded RGB) of the candidates against the
+// real frame, summed per workgroup and added to `out`:
+//   [0] repeat nearest  [1] crossfade  [2] interpolated  [3] A vs B (scene-cut detection)
+layout(descriptor_heap) uniform texture2D textures[];
+layout(buffer_reference, scalar) buffer Sums { float v[]; };
+
+layout(push_constant, scalar) uniform Push {
+    uint64_t out_sums;
+    uint truth, a, b, ours;
+    float t;
+} pc;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+shared vec4 partial[256];
+
+vec3 enc(vec3 c) { return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2)); }
+float se(vec3 x, vec3 y) { vec3 d = x - y; return dot(d, d); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(textures[nonuniformEXT(pc.truth)], 0);
+    vec4 e = vec4(0);
+    if (all(lessThan(p, size))) {
+        vec3 truth = enc(texelFetch(textures[nonuniformEXT(pc.truth)], p, 0).rgb);
+        vec3 a = texelFetch(textures[nonuniformEXT(pc.a)], p, 0).rgb;
+        vec3 b = texelFetch(textures[nonuniformEXT(pc.b)], p, 0).rgb;
+        vec3 ours = enc(texelFetch(textures[nonuniformEXT(pc.ours)], p, 0).rgb);
+        e.x = se(truth, enc(pc.t < 0.5 ? a : b));
+        e.y = se(truth, enc(mix(a, b, pc.t)));
+        e.z = se(truth, ours);
+        e.w = se(enc(a), enc(b));
+    }
+    uint i = gl_LocalInvocationIndex;
+    partial[i] = e;
+    barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (i < s) partial[i] += partial[i + s];
+        barrier();
+    }
+    if (i == 0) {
+        Sums out_sums = Sums(pc.out_sums);
+        for (int k = 0; k < 4; k++) atomicAdd(out_sums.v[k], partial[0][k]);
+    }
+}
