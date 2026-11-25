@@ -47,8 +47,12 @@ void main() {
     vec2 f = fract(q);
     vec4 c = splatAt(acc, i0) * (1.0 - f.x) * (1.0 - f.y) + splatAt(acc, i0 + ivec2(1, 0)) * f.x * (1.0 - f.y)
            + splatAt(acc, i0 + ivec2(0, 1)) * (1.0 - f.x) * f.y + splatAt(acc, i0 + ivec2(1, 1)) * f.x * f.y;
-    // Nothing landed here (rare: both frames' splats missed): blend in place.
-    vec3 hole = mix(frameA(x), frameB(x), pc.alpha);
-    vec3 col = c.w > 1e-3 ? c.rgb / c.w : hole;
+    // Full-resolution crossfade: exact where nothing moves, and the fallback where no
+    // splat landed. The splat result is built at the estimation size, so it is only used
+    // where the vectors show real motion (it would only soften static content).
+    vec3 crossfade = mix(shade(uv, pc.luma, pc.chroma), shade(uv, pc.luma_b, pc.chroma_b), pc.alpha);
+    float motion = max(length(flowAt(pc.vectors, x)), length(flowAt(pc.back_vectors, x)));
+    float moving = smoothstep(0.25, 1.0, motion);
+    vec3 col = c.w > 1e-3 ? mix(crossfade, c.rgb / c.w, moving) : crossfade;
     out_color = encodeOutput(vec4(col, 1.0));
 }
