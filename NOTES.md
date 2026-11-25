@@ -64,13 +64,17 @@ Read this first when resuming work. User preferences and decisions are binding.
 - On 300–330 s our worst frame (14.5 dB) is below crossfade's worst (16.0 dB):
   catastrophic failures exist; look at `--worst` heat maps there first.
 
+- Catastrophic frames were shot dissolves (eye close-up → landscape, endpoint 13 dB,
+  above the 12 dB cut threshold): vectors are noise, splat scrambled the frame. Fix: the
+  splat pass counts pixels whose vectors hold (color match + fb consistency) in an extra
+  accumulator element; video.frag falls back to the crossfade when < 25–50 % hold.
+  300–330 s worst frame 14.51 → 16.02 dB (= crossfade), mean 28.99 dB; 60–90 s unchanged.
+
 ## Next steps (in order)
-1. Investigate catastrophic frames (`codotaka-eval … --start 300 --worst dir/`): likely
-   wrong large vectors splatting content far away; consider a per-frame sanity fallback
-   (e.g. if splat vs crossfade disagree massively, or vectors exceed the search range).
-2. Large near-camera motion (bunny face): try 2×2 grid; check whether vectors hit the
+1. Large near-camera motion (bunny face): try 2×2 grid; check whether vectors hit the
    search limit (FLOW_DUMP); consider 3-level hints. Full-res splatting matters on 4K
    playback (eval runs at 1920 wide, roughly the estimation size).
+2. Evaluate on more content than BBB (live action, 24/30 fps sources with step 2–3).
 3. Learned refinement: RTX 3050 has VK_NV_cooperative_matrix2 (reductions, per-element
    ops, conversions, bf16) — a small RIFE-style network in our own compute shaders.
 4. Player leftovers: 5 ms polling during seek/pre-roll (eventfd from audio thread), volume,

@@ -60,5 +60,12 @@ void main() {
     float w = time_weight * exp(clamp(z, -15.0, 6.0));
 
     vec2 dest = p + (from_a ? t : 1.0 - t) * v;
-    splat(Accum(pc.data), dest, own, w);
+    Accum acc = Accum(pc.data);
+    splat(acc, dest, own, w);
+
+    // Frame-level reliability: how many pixels have a vector that holds (counted in the
+    // extra element after the per-pixel accumulator). Unrelated frames (dissolves, cuts)
+    // have almost none, and the display falls back to a crossfade.
+    bool reliable = colorDiff(own, other) < 0.08 && length(v + back) < 1.5;
+    if (reliable) atomicAdd(acc.v[uint(pc.flow_size.x * pc.flow_size.y)].x, 1.0);
 }

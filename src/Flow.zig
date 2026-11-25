@@ -166,7 +166,7 @@ pub fn create(gpa: std.mem.Allocator, device: *vk_core.Device, heaps: *vk_core.D
     }
 
     self.accum = try vk_core.Buffer.create(device, .{
-        .size = @as(u64, width) * height * 16,
+        .size = (@as(u64, width) * height + 1) * 16, // + frame-level reliability counter
         .usage = .{ .storage_buffer = true, .transfer_dst = true, .shader_device_address = true },
     });
 

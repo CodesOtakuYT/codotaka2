@@ -54,5 +54,8 @@ void main() {
     float motion = max(length(flowAt(pc.vectors, x)), length(flowAt(pc.back_vectors, x)));
     float moving = smoothstep(0.25, 1.0, motion);
     vec3 col = c.w > 1e-3 ? mix(crossfade, c.rgb / c.w, moving) : crossfade;
+    // Whole-frame sanity: if few vectors hold (dissolve, cut, chaos), trust the crossfade.
+    float reliable = acc.v[uint(pc.flow_size.x * pc.flow_size.y)].x / (2.0 * pc.flow_size.x * pc.flow_size.y);
+    col = mix(crossfade, col, smoothstep(0.25, 0.5, reliable));
     out_color = encodeOutput(vec4(col, 1.0));
 }
