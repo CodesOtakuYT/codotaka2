@@ -14,6 +14,7 @@ pub const Program = struct {
 };
 
 pub const ProgramId = enum(u32) { _ };
+pub const ComputeId = enum(u32) { _ };
 
 /// Fragment variants per output encoding (specialization constant 0 in shaders/output.glsl).
 pub const output_variants = 2;
@@ -23,6 +24,7 @@ const Shaders = struct { vert: vk.ShaderEXT, frag: [output_variants]vk.ShaderEXT
 gpa: Allocator,
 device: *Device,
 programs: std.ArrayList(Shaders) = .empty,
+computes: std.ArrayList(vk.ShaderEXT) = .empty,
 
 pub fn init(gpa: Allocator, device: *Device) ShaderCache {
     return .{ .gpa = gpa, .device = device };
@@ -35,6 +37,28 @@ pub fn deinit(self: *ShaderCache) void {
         for (p.frag) |f| self.device.proxy.destroyShaderEXT(f, null);
     }
     self.programs.deinit(self.gpa);
+    for (self.computes.items) |c| self.device.proxy.destroyShaderEXT(c, null);
+    self.computes.deinit(self.gpa);
+}
+
+/// A compute shader object (descriptor heap access, push data like graphics programs).
+pub fn registerCompute(self: *ShaderCache, spirv: []align(@alignOf(u32)) const u8) !ComputeId {
+    try self.computes.ensureUnusedCapacity(self.gpa, 1);
+    var shader: [1]vk.ShaderEXT = undefined;
+    _ = try self.device.proxy.createShadersEXT(&.{.{
+        .flags = .{ .descriptor_heap_ext = true },
+        .stage = .{ .compute = true },
+        .code_type = .spirv_ext,
+        .code_size = spirv.len,
+        .p_code = spirv.ptr,
+        .p_name = "main",
+    }}, null, &shader);
+    self.computes.appendAssumeCapacity(shader[0]);
+    return @enumFromInt(self.computes.items.len - 1);
+}
+
+pub fn bindCompute(self: *const ShaderCache, cmd: vk.CommandBufferProxy, id: ComputeId) void {
+    cmd.bindShadersEXT(&.{.{ .compute = true }}, &.{self.computes.items[@intFromEnum(id)]});
 }
 
 pub fn register(self: *ShaderCache, program: Program) !ProgramId {

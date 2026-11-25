@@ -81,6 +81,8 @@ out_cost: Target = .{},
 out_back_cost: Target = .{},
 out_global: Target = .{},
 slots: [2]Slot,
+/// Interpolation accumulator: vec4 (color * weight, weight) per estimation pixel.
+accum: vk_core.Buffer = .{},
 pool: vk.CommandPool = .null,
 sem: vk.Semaphore = .null,
 /// Last value signalled (or to be signalled) on `sem`.
@@ -162,6 +164,11 @@ pub fn create(gpa: std.mem.Allocator, device: *vk_core.Device, heaps: *vk_core.D
         s.global = try makeTarget(device, &families, null, sampled_vector_format, copy_dst, 1, 1);
         for ([_]*Target{ &s.vectors, &s.back_vectors, &s.cost, &s.global }) |t| t.slot = try heaps.addImageView(viewInfo(t.image, if (t == &s.cost) cost_format else sampled_vector_format));
     }
+
+    self.accum = try vk_core.Buffer.create(device, .{
+        .size = @as(u64, width) * height * 16,
+        .usage = .{ .storage_buffer = true, .transfer_dst = true, .shader_device_address = true },
+    });
 
     // Coarse pass: half resolution, forward vectors only (the full pass's hints).
     self.coarse_session = try dev.createOpticalFlowSessionNV(&.{
@@ -276,6 +283,7 @@ fn targets(self: *Flow) [4 + 7 + 4 * 2]*Target {
 fn destroyResources(self: *Flow) void {
     const dev = self.device.proxy;
     dev.destroySemaphore(self.sem, null);
+    self.accum.deinit(self.device);
     dev.destroyCommandPool(self.pool, null);
     dev.destroyOpticalFlowSessionNV(self.session, null);
     dev.destroyOpticalFlowSessionNV(self.coarse_session, null);

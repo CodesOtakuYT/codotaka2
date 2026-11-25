@@ -99,6 +99,8 @@ pub const Features = struct {
     video_vp9: vk.PhysicalDeviceVideoDecodeVP9FeaturesKHR = .{},
     /// Only linked when optical flow is enabled.
     optical_flow: vk.PhysicalDeviceOpticalFlowFeaturesNV = .{},
+    /// Only linked with optical flow (frame interpolation splats with float atomics).
+    atomic_float: vk.PhysicalDeviceShaderAtomicFloatFeaturesEXT = .{},
 
     /// Appends an optional feature struct to the end of the linked chain.
     fn append(f: *Features, node: anytype) void {
@@ -265,6 +267,9 @@ pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate
         try extensions.appendSlice(gpa, &.{ vk.device_extensions.nv_optical_flow.name, vk.device_extensions.khr_format_feature_flags_2.name });
         features.optical_flow = .{ .optical_flow = .true };
         features.append(&features.optical_flow);
+        try extensions.append(gpa, vk.device_extensions.ext_shader_atomic_float.name);
+        features.atomic_float = .{ .shader_buffer_float_32_atomic_add = .true };
+        features.append(&features.atomic_float);
     };
 
     const priority = [_]f32{1.0};

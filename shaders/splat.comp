@@ -1,0 +1,64 @@
+#version 460
+#extension GL_EXT_descriptor_heap : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_GOOGLE_include_directive : require
+#include "video_common.glsl"
+
+// Forward splatting for frame interpolation (softmax splatting, Niklaus & Liu 2020).
+// Every pixel of one source frame moves along its own vector to time t and adds its color
+// to the accumulator with weight exp(z): where splats collide, the most plausible
+// foreground dominates; uncovered background receives splats only from the frame that
+// shows it. Run once for A (mode 0) and once for B (mode 1).
+layout(local_size_x = 16, local_size_y = 16) in;
+
+void splat(Accum acc, vec2 p, vec3 color, float w) {
+    ivec2 size = ivec2(pc.flow_size);
+    vec2 q = p - 0.5;
+    ivec2 i0 = ivec2(floor(q));
+    vec2 f = fract(q);
+    for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        ivec2 i = i0 + o;
+        if (any(lessThan(i, ivec2(0))) || any(greaterThanEqual(i, size))) continue;
+        float bw = (o.x == 1 ? f.x : 1.0 - f.x) * (o.y == 1 ? f.y : 1.0 - f.y) * w;
+        if (bw <= 0.0) continue;
+        uint idx = uint(i.y * size.x + i.x);
+        atomicAdd(acc.v[idx].x, color.r * bw);
+        atomicAdd(acc.v[idx].y, color.g * bw);
+        atomicAdd(acc.v[idx].z, color.b * bw);
+        atomicAdd(acc.v[idx].w, bw);
+    }
+}
+
+void main() {
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(id, ivec2(pc.flow_size)))) return;
+    vec2 p = vec2(id) + 0.5;
+    float t = pc.alpha;
+    bool from_a = pc.mode == 0u;
+
+    // This frame's own motion toward the other frame, and the camera motion in the same
+    // direction (global flow is B -> A).
+    vec2 v = from_a ? flowAt(pc.back_vectors, p) : flowAt(pc.vectors, p);
+    vec2 back = from_a ? flowAt(pc.vectors, p + v) : flowAt(pc.back_vectors, p + v);
+    vec2 g = vectorAt(pc.global_flow, ivec2(0));
+    vec2 camera = from_a ? -g : g;
+
+    vec3 own = from_a ? frameA(p) : frameB(p);
+    vec3 other = from_a ? frameB(p + v) : frameA(p + v);
+
+    // Importance z: brightness constancy along the vector, forward-backward consistency,
+    // and motion that stands out from the camera motion (likely foreground).
+    float z = -12.0 * colorDiff(own, other) - 1.0 * min(length(v + back), 8.0)
+            + 0.15 * min(length(v - camera), 20.0);
+    float time_weight = from_a ? 1.0 - t : t;
+    float w = time_weight * exp(clamp(z, -15.0, 6.0));
+
+    vec2 dest = p + (from_a ? t : 1.0 - t) * v;
+    splat(Accum(pc.data), dest, own, w);
+}

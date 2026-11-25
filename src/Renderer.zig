@@ -88,6 +88,7 @@ const spv = struct {
     const rect_frag align(@alignOf(u32)) = @embedFile("rect.frag.spv").*;
     const video_frag align(@alignOf(u32)) = @embedFile("video.frag.spv").*;
     const luma_frag align(@alignOf(u32)) = @embedFile("luma.frag.spv").*;
+    const splat_comp align(@alignOf(u32)) = @embedFile("splat.comp.spv").*;
 };
 
 /// Instance layout read by shaders/text.vert.
@@ -107,6 +108,7 @@ device: *vk_core.Device,
 heaps: vk_core.DescriptorHeaps,
 shaders: vk_core.ShaderCache,
 ids: std.EnumArray(Program, vk_core.ShaderCache.ProgramId),
+splat_id: vk_core.ShaderCache.ComputeId = undefined,
 linear_sampler: vk_core.DescriptorHeaps.SamplerSlot,
 atlas: Atlas,
 /// Shared CPU glyph cache; read-only while render tasks run.
@@ -152,6 +154,7 @@ pub fn create(gpa: Allocator, device: *vk_core.Device, glyphs: *const text.Glyph
     self.ids.set(.video, try self.shaders.register(.{ .vert = &spv.video_vert, .frag = &spv.video_frag }));
     self.ids.set(.rect, try self.shaders.register(.{ .vert = &spv.rect_vert, .frag = &spv.rect_frag }));
     self.ids.set(.luma, try self.shaders.register(.{ .vert = &spv.video_vert, .frag = &spv.luma_frag }));
+    self.splat_id = try self.shaders.registerCompute(&spv.splat_comp);
     self.linear_sampler = try self.heaps.addSampler(.{
         .mag_filter = .linear,
         .min_filter = .linear,
@@ -216,7 +219,7 @@ fn endFrame(ctx: *anyopaque, sync: *vk_core.FrameRing.Sync) !void {
         try sync.signal(w.sem, w.value + 1);
     }
     if (self.flow) |f| {
-        if (self.flow_use) |slot| try sync.wait(f.sem, slot.ready, .{ .fragment_shader = true });
+        if (self.flow_use) |slot| try sync.wait(f.sem, slot.ready, .{ .compute_shader = true, .fragment_shader = true });
         if (self.flow_luma_done) |v| {
             // The previous estimation must be done reading the luma images we overwrote.
             if (v > 1) try sync.wait(f.sem, v - 1, .{ .all_commands = true });
@@ -376,6 +379,75 @@ fn estimate(self: *Renderer, cmd: vk.CommandBufferProxy, f: *Flow, a: *const med
     slot.ready = values.flow_done;
 }
 
+/// Push data for drawing (or splatting) a video draw, including the interpolation inputs
+/// when this frame has vectors for the shown pair.
+fn videoPush(self: *Renderer, vd: VideoDraw) !VideoPush {
+    const f = vd.frame;
+    const slots = try self.videoSlots(f);
+    const col = f.colorimetry();
+    var vp: VideoPush = .{
+        .dst = vd.dst,
+        .uv_max = .{
+            @as(f32, @floatFromInt(f.width())) / @as(f32, @floatFromInt(f.codedWidth())),
+            @as(f32, @floatFromInt(f.height())) / @as(f32, @floatFromInt(f.codedHeight())),
+        },
+        .luma = @intFromEnum(slots[0]),
+        .chroma = @intFromEnum(slots[1]),
+        .smp = @intFromEnum(self.linear_sampler),
+        .matrix = @intFromEnum(col.matrix),
+        .transfer = @intFromEnum(col.transfer),
+        .primaries = @intFromEnum(col.primaries),
+        .full_range = @intFromBool(col.full_range),
+        .bit_depth = col.bit_depth,
+        .output_hdr = vd.output_hdr,
+        .white_scale = vd.white_scale,
+        .peak = 1000.0 / 203.0,
+    };
+    if (self.flow_use != null and vd.next != null and vd.interpolation != .off) {
+        const fl = self.flow.?;
+        const fs = self.flow_use.?;
+        const nslots = try self.videoSlots(vd.next.?);
+        vp.mode = @intFromEnum(vd.interpolation);
+        vp.luma_b = @intFromEnum(nslots[0]);
+        vp.chroma_b = @intFromEnum(nslots[1]);
+        vp.vectors = @intFromEnum(fs.vectors.slot.?);
+        vp.global = @intFromEnum(fs.global.slot.?);
+        vp.cost = @intFromEnum(fs.cost.slot.?);
+        vp.debug_luma = @intFromEnum(fl.luma_slot[Flow.input]);
+        vp.back_vectors = @intFromEnum(fs.back_vectors.slot.?);
+        vp.alpha = vd.alpha;
+        vp.flow_size = .{ @floatFromInt(fl.width), @floatFromInt(fl.height) };
+        vp.grid_size = .{ @floatFromInt(fl.gridSize()[0]), @floatFromInt(fl.gridSize()[1]) };
+    }
+    return vp;
+}
+
+/// Renders the in-between frame into the accumulator: forward splats of A and of B.
+fn splatFrame(self: *Renderer, cmd: vk.CommandBufferProxy, vd: VideoDraw) !void {
+    const f = self.flow.?;
+    var vp = try self.videoPush(vd);
+    if (vp.mode != @intFromEnum(Interpolation.on)) return;
+    vp.data = f.accum.address;
+    const all: vk.PipelineStageFlags2 = .{ .all_commands = true };
+    const rw: vk.AccessFlags2 = .{ .memory_read = true, .memory_write = true };
+    memoryBarrier(cmd, all, rw, .{ .clear = true }, .{ .transfer_write = true });
+    cmd.fillBuffer(f.accum.buffer, 0, vk.WHOLE_SIZE, 0);
+    memoryBarrier(cmd, .{ .clear = true }, .{ .transfer_write = true }, .{ .compute_shader = true }, rw);
+    self.shaders.bindCompute(cmd, self.splat_id);
+    const groups = [2]u32{ (f.width + 15) / 16, (f.height + 15) / 16 };
+    for ([_]u32{ 0, 1 }) |side| {
+        vp.mode = side;
+        cmd.pushDataEXT(&.{ .offset = 0, .data = .{ .address = &vp, .size = @sizeOf(VideoPush) } });
+        cmd.dispatch(groups[0], groups[1], 1);
+    }
+    memoryBarrier(cmd, .{ .compute_shader = true }, .{ .memory_write = true }, .{ .fragment_shader = true }, .{ .memory_read = true });
+}
+
+fn memoryBarrier(cmd: vk.CommandBufferProxy, src_stage: vk.PipelineStageFlags2, src_access: vk.AccessFlags2, dst_stage: vk.PipelineStageFlags2, dst_access: vk.AccessFlags2) void {
+    const mb = [_]vk.MemoryBarrier2{.{ .src_stage_mask = src_stage, .src_access_mask = src_access, .dst_stage_mask = dst_stage, .dst_access_mask = dst_access }};
+    cmd.pipelineBarrier2(&.{ .memory_barrier_count = mb.len, .p_memory_barriers = &mb });
+}
+
 /// Clears the target and draws every view into it within one dynamic-rendering pass.
 fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.Linear, target: vk_present.Presenter.Recorder.Target, views: []const frame.View) !void {
     const self: *Renderer = @ptrCast(@alignCast(ctx));
@@ -392,6 +464,7 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
                 try self.acquireVideoFrame(cmd, next);
                 if (vd.after) |after| try self.acquireVideoFrame(cmd, after);
                 try self.prepareFlow(cmd, vd.frame, next, vd.after);
+                if (self.flow_use != null) try self.splatFrame(cmd, vd);
             };
         },
         else => {},
@@ -445,43 +518,8 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
         var push_len: usize = 8;
         if (program == .video) {
             const vd = std.mem.bytesToValue(VideoDraw, v.draw.data);
-            const f = vd.frame;
-            const slots = try self.videoSlots(f);
-            const col = f.colorimetry();
-            var vp: VideoPush = .{
-                .dst = vd.dst,
-                .uv_max = .{
-                    @as(f32, @floatFromInt(f.width())) / @as(f32, @floatFromInt(f.codedWidth())),
-                    @as(f32, @floatFromInt(f.height())) / @as(f32, @floatFromInt(f.codedHeight())),
-                },
-                .luma = @intFromEnum(slots[0]),
-                .chroma = @intFromEnum(slots[1]),
-                .smp = @intFromEnum(self.linear_sampler),
-                .matrix = @intFromEnum(col.matrix),
-                .transfer = @intFromEnum(col.transfer),
-                .primaries = @intFromEnum(col.primaries),
-                .full_range = @intFromBool(col.full_range),
-                .bit_depth = col.bit_depth,
-                .output_hdr = vd.output_hdr,
-                .white_scale = vd.white_scale,
-                .peak = 1000.0 / 203.0,
-            };
-            if (self.flow_use != null and vd.next != null and vd.interpolation != .off) {
-                const fl = self.flow.?;
-                const fs = self.flow_use.?;
-                const nslots = try self.videoSlots(vd.next.?);
-                vp.mode = @intFromEnum(vd.interpolation);
-                vp.luma_b = @intFromEnum(nslots[0]);
-                vp.chroma_b = @intFromEnum(nslots[1]);
-                vp.vectors = @intFromEnum(fs.vectors.slot.?);
-                vp.global = @intFromEnum(fs.global.slot.?);
-                vp.cost = @intFromEnum(fs.cost.slot.?);
-                vp.debug_luma = @intFromEnum(fl.luma_slot[Flow.input]);
-                vp.back_vectors = @intFromEnum(fs.back_vectors.slot.?);
-                vp.alpha = vd.alpha;
-                vp.flow_size = .{ @floatFromInt(fl.width), @floatFromInt(fl.height) };
-                vp.grid_size = .{ @floatFromInt(fl.gridSize()[0]), @floatFromInt(fl.gridSize()[1]) };
-            }
+            var vp = try self.videoPush(vd);
+            if (vp.mode == @intFromEnum(Interpolation.on)) vp.data = self.flow.?.accum.address;
             @memcpy(push[0..@sizeOf(VideoPush)], std.mem.asBytes(&vp));
             push_len = @sizeOf(VideoPush);
         } else if (program == .text) {
