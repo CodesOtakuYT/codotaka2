@@ -1,8 +1,7 @@
 # codotaka
 
-A cutting-edge Zig + Wayland + Vulkan 1.4 media/UI foundation. Today it is a zero-copy
-video player with audio, seeking, an on-screen display and optional optical-flow frame
-interpolation; the long-term goal is a Helix-style code editor built on the same stack.
+A cutting-edge Zig + Wayland + Vulkan 1.4 media/UI foundation: a zero-copy video player
+with audio, seeking, an on-screen display and optional optical-flow frame interpolation.
 
 ## Requirements
 

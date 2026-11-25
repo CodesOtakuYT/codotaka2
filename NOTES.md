@@ -11,8 +11,6 @@ Read this first when resuming work. User preferences and decisions are binding.
 - Commit with `git -c user.name=codotaku -c user.email=codotaku@localhost commit`.
 - Never inject keys into the desktop unless the player has focus (`/tmp/opencode/uinput_*.py`
   typed into the user's terminal once). Prefer env vars and the offline eval tool.
-- Long-term goal: Helix/Kakoune-style modal editor, one window with splits, monospace
-  grid + optional ligatures, HarfBuzz/FreeType/SheenBidi/libunibreak, xkbcommon.
 
 ## Architecture decisions
 - Presentation: raw dmabuf + linux-drm-syncobj (no VkSwapchainKHR), tranche-aware,
@@ -67,7 +65,6 @@ Read this first when resuming work. User preferences and decisions are binding.
    ops, conversions, bf16) — a small RIFE-style network in our own compute shaders.
 4. Player leftovers: 5 ms polling during seek/pre-roll (eventfd from audio thread), volume,
    audio lost on pause (~214 ms BT buffer), OSD text slightly high.
-5. Then: the editor roadmap.
 
 ## Useful commands
 - Debug run + validation: `CODOTAKA_EXIT_AFTER=6 ./zig-out/bin/codotaka <file>`
