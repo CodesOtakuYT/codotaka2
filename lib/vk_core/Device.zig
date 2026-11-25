@@ -48,6 +48,10 @@ queue: vk.QueueProxy,
 queue_families: []QueueFamily,
 /// Video decode family, if requested and available.
 decode_family: ?QueueFamily = null,
+/// NVIDIA optical flow (VK_NV_optical_flow) queue, if requested and available.
+flow_family: ?u32 = null,
+flow_queue: ?vk.QueueProxy = null,
+flow_props: ?vk.PhysicalDeviceOpticalFlowPropertiesNV = null,
 /// Everything enabled at creation, kept alive for interop (FFmpeg wants both).
 enabled_extensions: [][*:0]const u8,
 features: *Features,
@@ -65,6 +69,8 @@ pub const Options = struct {
     /// Also create a video-decode queue and enable Vulkan Video decode for every codec the
     /// device supports (H.264, H.265, AV1, VP9).
     video_decode: bool = false,
+    /// Also create an optical-flow queue (VK_NV_optical_flow) when the device has one.
+    optical_flow: bool = false,
 };
 
 const video_codec_extensions = .{
@@ -91,6 +97,15 @@ pub const Features = struct {
     video_maintenance1: vk.PhysicalDeviceVideoMaintenance1FeaturesKHR = .{},
     /// Only linked when VP9 decode is supported.
     video_vp9: vk.PhysicalDeviceVideoDecodeVP9FeaturesKHR = .{},
+    /// Only linked when optical flow is enabled.
+    optical_flow: vk.PhysicalDeviceOpticalFlowFeaturesNV = .{},
+
+    /// Appends an optional feature struct to the end of the linked chain.
+    fn append(f: *Features, node: anytype) void {
+        var tail: *vk.BaseOutStructure = @ptrCast(&f.core);
+        while (tail.p_next) |n| tail = n;
+        tail.p_next = @ptrCast(node);
+    }
 
     /// Links the chain; returns the PhysicalDeviceFeatures2 head.
     fn link(f: *Features) *vk.PhysicalDeviceFeatures2 {
@@ -179,6 +194,28 @@ pub fn findDecodeFamily(instance: *Instance, gpa: Allocator, pdev: vk.PhysicalDe
     return null;
 }
 
+/// The optical-flow queue family and limits, if the device supports VK_NV_optical_flow.
+fn findOpticalFlow(instance: *Instance, gpa: Allocator, pdev: vk.PhysicalDevice) !?struct { family: u32, props: vk.PhysicalDeviceOpticalFlowPropertiesNV } {
+    const exts = try instance.proxy.enumerateDeviceExtensionPropertiesAlloc(pdev, null, gpa);
+    defer gpa.free(exts);
+    for (exts) |e| {
+        if (std.mem.eql(u8, std.mem.sliceTo(&e.extension_name, 0), vk.device_extensions.nv_optical_flow.name)) break;
+    } else return null;
+    var have: vk.PhysicalDeviceOpticalFlowFeaturesNV = .{};
+    var f2: vk.PhysicalDeviceFeatures2 = .{ .p_next = &have, .features = .{} };
+    instance.proxy.getPhysicalDeviceFeatures2(pdev, &f2);
+    if (have.optical_flow != .true) return null;
+    var props: vk.PhysicalDeviceOpticalFlowPropertiesNV = undefined;
+    props.s_type = .physical_device_optical_flow_properties_nv;
+    props.p_next = null;
+    var p2: vk.PhysicalDeviceProperties2 = .{ .p_next = &props, .properties = undefined };
+    instance.proxy.getPhysicalDeviceProperties2(pdev, &p2);
+    const families = try instance.proxy.getPhysicalDeviceQueueFamilyPropertiesAlloc(pdev, gpa);
+    defer gpa.free(families);
+    for (families, 0..) |fam, i| if (fam.queue_flags.optical_flow_nv) return .{ .family = @intCast(i), .props = props };
+    return null;
+}
+
 pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate, opts: Options) !*Device {
     const self = try gpa.create(Device);
     errdefer gpa.destroy(self);
@@ -210,17 +247,28 @@ pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate
             inline for (video_codec_extensions) |e| if (@field(fam.video_ops, e[0])) try extensions.append(gpa, e[1]);
             features.f11.sampler_ycbcr_conversion = .true;
             features.video_maintenance1 = .{ .video_maintenance_1 = .true };
-            features.robustness2.p_next = &features.video_maintenance1;
+            features.append(&features.video_maintenance1);
             // VP9 decode is gated by a feature in addition to its extension.
             if (fam.video_ops.decode_vp9_khr) {
                 features.video_vp9 = .{ .video_decode_vp9 = .true };
-                features.video_maintenance1.p_next = &features.video_vp9;
+                features.append(&features.video_vp9);
             }
         } else log.warn("no video decode queue on {s}", .{std.mem.sliceTo(&candidate.props.device_name, 0)});
     }
 
+    var flow_family: ?u32 = null;
+    var flow_props: ?vk.PhysicalDeviceOpticalFlowPropertiesNV = null;
+    if (opts.optical_flow) if (try findOpticalFlow(instance, gpa, candidate.pdev)) |found| {
+        flow_family = found.family;
+        flow_props = found.props;
+        try families.append(gpa, .{ .index = found.family, .flags = .{ .optical_flow_nv = true } });
+        try extensions.appendSlice(gpa, &.{ vk.device_extensions.nv_optical_flow.name, vk.device_extensions.khr_format_feature_flags_2.name });
+        features.optical_flow = .{ .optical_flow = .true };
+        features.append(&features.optical_flow);
+    };
+
     const priority = [_]f32{1.0};
-    var queue_infos: [2]vk.DeviceQueueCreateInfo = undefined;
+    var queue_infos: [3]vk.DeviceQueueCreateInfo = undefined;
     for (families.items, 0..) |fam, i| queue_infos[i] = .{
         .flags = .{ .internally_synchronized_khr = true },
         .queue_family_index = fam.index,
@@ -253,6 +301,8 @@ pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate
         .queue = undefined,
         .queue_families = try families.toOwnedSlice(gpa),
         .decode_family = decode,
+        .flow_family = flow_family,
+        .flow_props = flow_props,
         .enabled_extensions = try extensions.toOwnedSlice(gpa),
         .features = features,
         .memory = .init(instance.proxy, candidate.pdev),
@@ -263,6 +313,12 @@ pub fn create(gpa: Allocator, instance: *Instance, candidate: Instance.Candidate
     self.queue = vk.QueueProxy.init(self.proxy.getDeviceQueue2(&.{
         .flags = .{ .internally_synchronized_khr = true },
         .queue_family_index = self.queue_family,
+        .queue_index = 0,
+    }), &self.vkd);
+
+    if (flow_family) |fam| self.flow_queue = vk.QueueProxy.init(self.proxy.getDeviceQueue2(&.{
+        .flags = .{ .internally_synchronized_khr = true },
+        .queue_family_index = fam,
         .queue_index = 0,
     }), &self.vkd);
 
@@ -315,6 +371,7 @@ pub fn waitValue(self: *Device, value: u64) !void {
 pub fn waitIdle(self: *Device) void {
     self.waitValue(self.lastValue()) catch {};
     self.queue.waitIdle() catch {};
+    if (self.flow_queue) |q| q.waitIdle() catch {};
 }
 
 /// Defers destruction until all work submitted so far has completed and `ready` holds.

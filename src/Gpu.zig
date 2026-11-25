@@ -17,7 +17,7 @@ renderer: *Renderer,
 arena: std.heap.ArenaAllocator,
 
 pub fn create(gpa: Allocator, instance: *vk_core.Instance, candidate: vk_core.Instance.Candidate, glyphs: *const text.GlyphCache, video_decode: bool) !*Gpu {
-    const device = try vk_core.Device.create(gpa, instance, candidate, .{ .extensions = &vk_present.device_extensions, .video_decode = video_decode });
+    const device = try vk_core.Device.create(gpa, instance, candidate, .{ .extensions = &vk_present.device_extensions, .video_decode = video_decode, .optical_flow = video_decode });
     errdefer device.destroy();
     const presenter = try vk_present.Presenter.create(gpa, device, vk_present.drmInfo(instance, candidate.pdev));
     errdefer presenter.destroy();

@@ -12,10 +12,11 @@ const frame = @import("frame");
 const text = @import("text");
 const geom = @import("geom");
 const media = @import("media");
+const Flow = @import("Flow.zig");
 const Atlas = @import("Atlas.zig");
 const Allocator = std.mem.Allocator;
 
-pub const Program = enum(u32) { triangle, decoration, text, video, rect };
+pub const Program = enum(u32) { triangle, decoration, text, video, rect, luma };
 
 /// Instance layout read by shaders/rect.vert; draws carry `[]RectInstance` as data and
 /// `RectPush` as push data.
@@ -37,7 +38,15 @@ pub const VideoDraw = extern struct {
     dst: [4]f32,
     output_hdr: u32,
     white_scale: f32,
+    /// Next frame, for motion-compensated interpolation (optical flow) at `alpha`.
+    next: ?*const media.Frame = null,
+    /// The frame after `next`, so its vectors can be estimated ahead.
+    after: ?*const media.Frame = null,
+    alpha: f32 = 0,
+    interpolation: Interpolation = .off,
 };
+
+pub const Interpolation = enum(u32) { off = 0, on = 1, show_vectors = 2, show_luma = 3 };
 
 const VideoPush = extern struct {
     data: u64 = 0,
@@ -54,6 +63,16 @@ const VideoPush = extern struct {
     output_hdr: u32,
     white_scale: f32,
     peak: f32,
+    mode: u32 = 0,
+    luma_b: u32 = 0,
+    chroma_b: u32 = 0,
+    vectors: u32 = 0,
+    cost: u32 = 0,
+    alpha: f32 = 0,
+    flow_size: [2]f32 = .{ 0, 0 },
+    grid_size: [2]f32 = .{ 0, 0 },
+    debug_luma: u32 = 0,
+    back_vectors: u32 = 0,
 };
 
 const spv = struct {
@@ -67,6 +86,7 @@ const spv = struct {
     const rect_vert align(@alignOf(u32)) = @embedFile("rect.vert.spv").*;
     const rect_frag align(@alignOf(u32)) = @embedFile("rect.frag.spv").*;
     const video_frag align(@alignOf(u32)) = @embedFile("video.frag.spv").*;
+    const luma_frag align(@alignOf(u32)) = @embedFile("luma.frag.spv").*;
 };
 
 /// Instance layout read by shaders/text.vert.
@@ -100,6 +120,16 @@ retired_slots: std.ArrayList(struct { slot: vk_core.DescriptorHeaps.ImageSlot, a
 locked: std.ArrayList(*const media.Frame) = .empty,
 sync_waits: std.ArrayList(struct { sem: vk.Semaphore, value: u64 }) = .empty,
 
+/// Optical flow for frame interpolation (created on first use, NVIDIA only).
+flow: ?*Flow = null,
+/// This frame: luma written for a new pair; signal this value and then run the estimation
+/// into `flow_slot`.
+flow_luma_done: ?u64 = null,
+flow_slot: ?*const Flow.Slot = null,
+/// This frame samples these vectors (waits for the slot's `ready` value).
+flow_use: ?*const Flow.Slot = null,
+flow_stats: struct { estimated: u64 = 0, reused: u64 = 0 } = .{},
+
 pub fn create(gpa: Allocator, device: *vk_core.Device, glyphs: *const text.GlyphCache) !*Renderer {
     const self = try gpa.create(Renderer);
     errdefer gpa.destroy(self);
@@ -120,6 +150,7 @@ pub fn create(gpa: Allocator, device: *vk_core.Device, glyphs: *const text.Glyph
     self.ids.set(.text, try self.shaders.register(.{ .vert = &spv.text_vert, .frag = &spv.text_frag }));
     self.ids.set(.video, try self.shaders.register(.{ .vert = &spv.video_vert, .frag = &spv.video_frag }));
     self.ids.set(.rect, try self.shaders.register(.{ .vert = &spv.rect_vert, .frag = &spv.rect_frag }));
+    self.ids.set(.luma, try self.shaders.register(.{ .vert = &spv.video_vert, .frag = &spv.luma_frag }));
     self.linear_sampler = try self.heaps.addSampler(.{
         .mag_filter = .linear,
         .min_filter = .linear,
@@ -143,6 +174,8 @@ pub fn create(gpa: Allocator, device: *vk_core.Device, glyphs: *const text.Glyph
 
 /// The device must be idle.
 pub fn destroy(self: *Renderer) void {
+    if (self.flow) |f| f.destroy(self.gpa);
+    if (self.flow_stats.estimated > 0) std.log.info("optical flow: {d} estimations, {d} interpolated draws", .{ self.flow_stats.estimated, self.flow_stats.reused });
     self.scratch.deinit(self.gpa);
     self.video_slots.deinit(self.gpa);
     self.retired_slots.deinit(self.gpa);
@@ -161,6 +194,8 @@ pub fn recorder(self: *Renderer) vk_present.Presenter.Recorder {
 fn beginFrame(ctx: *anyopaque, cmd: vk.CommandBufferProxy) !void {
     const self: *Renderer = @ptrCast(@alignCast(ctx));
     self.heaps.bind(cmd);
+    self.flow_luma_done = null;
+    self.flow_use = null;
     // Free plane descriptors of old decoder pools once no submitted work can use them.
     const completed = try self.device.completedValue();
     var i: usize = 0;
@@ -179,10 +214,20 @@ fn endFrame(ctx: *anyopaque, sync: *vk_core.FrameRing.Sync) !void {
         try sync.wait(w.sem, w.value, .{ .fragment_shader = true });
         try sync.signal(w.sem, w.value + 1);
     }
+    if (self.flow) |f| {
+        if (self.flow_use) |slot| try sync.wait(f.sem, slot.ready, .{ .fragment_shader = true });
+        if (self.flow_luma_done) |v| {
+            // The previous estimation must be done reading the luma images we overwrote.
+            if (v > 1) try sync.wait(f.sem, v - 1, .{ .all_commands = true });
+            try sync.signal(f.sem, v);
+        }
+    }
 }
 
 fn submitted(ctx: *anyopaque) void {
     const self: *Renderer = @ptrCast(@alignCast(ctx));
+    if (self.flow_luma_done) |v| self.flow.?.execute(self.flow_slot.?, v) catch |err| std.log.err("optical flow submit: {t}", .{err});
+    self.flow_luma_done = null;
     for (self.locked.items) |f| f.unlock();
     self.locked.clearRetainingCapacity();
     self.sync_waits.clearRetainingCapacity();
@@ -243,6 +288,84 @@ fn acquireVideoFrame(self: *Renderer, cmd: vk.CommandBufferProxy, f: *const medi
     vkf.sem_value[0] += 1;
 }
 
+/// Makes vectors for the shown pair (a, b) available, estimating them now if needed
+/// (usable from the next frame), otherwise estimating the following pair (b, c) ahead so
+/// it is ready when shown.
+fn prepareFlow(self: *Renderer, cmd: vk.CommandBufferProxy, a: *const media.Frame, b: *const media.Frame, c: ?*const media.Frame) !void {
+    if (!Flow.supported(self.device)) return;
+    const size = Flow.sizeFor(self.device, a.width(), a.height());
+    if (self.flow) |f| if (f.width != size[0] or f.height != size[1]) {
+        self.device.waitIdle();
+        f.destroy(self.gpa);
+        self.flow = null;
+    };
+    if (self.flow == null) self.flow = Flow.create(self.gpa, self.device, &self.heaps, size[0], size[1]) catch |err| {
+        std.log.err("optical flow unavailable: {t}", .{err});
+        return err;
+    };
+    const f = self.flow.?;
+    const key = [2]i64{ a.pts_ns, b.pts_ns };
+    if (f.find(key)) |slot| {
+        self.flow_use = slot;
+        self.flow_stats.reused += 1;
+        if (self.flow_stats.reused % 60 == 0 and std.c.getenv("CODOTAKA_FLOW_DUMP") != null) f.dumpStats(slot);
+        if (c) |cc| {
+            const ahead = [2]i64{ b.pts_ns, cc.pts_ns };
+            if (f.find(ahead) == null) try self.estimate(cmd, f, b, cc, if (slot == &f.slots[0]) &f.slots[1] else &f.slots[0]);
+        }
+        return;
+    }
+    try self.estimate(cmd, f, a, b, &f.slots[0]);
+}
+
+fn estimate(self: *Renderer, cmd: vk.CommandBufferProxy, f: *Flow, a: *const media.Frame, b: *const media.Frame, slot: *Flow.Slot) !void {
+    if (self.flow_luma_done != null) return; // one estimation per frame
+    self.flow_stats.estimated += 1;
+    f.initLayouts(cmd);
+    for ([2]*const media.Frame{ a, b }, [2]usize{ Flow.ref, Flow.input }) |src, which| {
+        const slots = try self.videoSlots(src);
+        const attachment = [_]vk.RenderingAttachmentInfo{.{
+            .image_view = f.luma[which].view,
+            .image_layout = .general,
+            .resolve_mode = .{},
+            .resolve_image_layout = .undefined,
+            .load_op = .dont_care,
+            .store_op = .store,
+            .clear_value = undefined,
+        }};
+        const extent: vk.Extent2D = .{ .width = f.width, .height = f.height };
+        cmd.beginRendering(&.{
+            .render_area = .{ .offset = .{ .x = 0, .y = 0 }, .extent = extent },
+            .layer_count = 1,
+            .view_mask = 0,
+            .color_attachment_count = 1,
+            .p_color_attachments = &attachment,
+        });
+        vk_core.ShaderCache.setDefaultState(cmd);
+        self.shaders.bind(cmd, self.ids.get(.luma), 0);
+        vk_core.ShaderCache.setBlend(cmd, .none);
+        cmd.setViewportWithCount(&.{.{ .x = 0, .y = 0, .width = @floatFromInt(f.width), .height = @floatFromInt(f.height), .min_depth = 0, .max_depth = 1 }});
+        cmd.setScissorWithCount(&.{.{ .offset = .{ .x = 0, .y = 0 }, .extent = extent }});
+        var vp = std.mem.zeroes(VideoPush);
+        vp.dst = .{ -1, -1, 1, 1 };
+        vp.uv_max = .{
+            @as(f32, @floatFromInt(src.width())) / @as(f32, @floatFromInt(src.codedWidth())),
+            @as(f32, @floatFromInt(src.height())) / @as(f32, @floatFromInt(src.codedHeight())),
+        };
+        vp.luma = @intFromEnum(slots[0]);
+        vp.chroma = @intFromEnum(slots[1]);
+        vp.smp = @intFromEnum(self.linear_sampler);
+        cmd.pushDataEXT(&.{ .offset = 0, .data = .{ .address = &vp, .size = @sizeOf(VideoPush) } });
+        cmd.draw(6, 1, 0, 0);
+        cmd.endRendering();
+    }
+    const values = f.reserve();
+    self.flow_luma_done = values.luma_done;
+    self.flow_slot = slot;
+    slot.key = .{ a.pts_ns, b.pts_ns };
+    slot.ready = values.flow_done;
+}
+
 /// Clears the target and draws every view into it within one dynamic-rendering pass.
 fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.Linear, target: vk_present.Presenter.Recorder.Target, views: []const frame.View) !void {
     const self: *Renderer = @ptrCast(@alignCast(ctx));
@@ -252,7 +375,15 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
         .text => for (std.mem.bytesAsSlice(text.Quad, @as([]align(4) const u8, @alignCast(v.draw.data)))) |q| {
             _ = try self.atlas.ensure(self.glyphs, q.glyph);
         },
-        .video => try self.acquireVideoFrame(cmd, std.mem.bytesToValue(VideoDraw, v.draw.data).frame),
+        .video => {
+            const vd = std.mem.bytesToValue(VideoDraw, v.draw.data);
+            try self.acquireVideoFrame(cmd, vd.frame);
+            if (vd.interpolation != .off) if (vd.next) |next| {
+                try self.acquireVideoFrame(cmd, next);
+                if (vd.after) |after| try self.acquireVideoFrame(cmd, after);
+                try self.prepareFlow(cmd, vd.frame, next, vd.after);
+            };
+        },
         else => {},
     };
     try self.atlas.flush(self.glyphs);
@@ -307,7 +438,7 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
             const f = vd.frame;
             const slots = try self.videoSlots(f);
             const col = f.colorimetry();
-            const vp: VideoPush = .{
+            var vp: VideoPush = .{
                 .dst = vd.dst,
                 .uv_max = .{
                     @as(f32, @floatFromInt(f.width())) / @as(f32, @floatFromInt(f.codedWidth())),
@@ -325,6 +456,21 @@ fn record(ctx: *anyopaque, cmd: vk.CommandBufferProxy, upload: *vk_core.Buffer.L
                 .white_scale = vd.white_scale,
                 .peak = 1000.0 / 203.0,
             };
+            if (self.flow_use != null and vd.next != null and vd.interpolation != .off) {
+                const fl = self.flow.?;
+                const fs = self.flow_use.?;
+                const nslots = try self.videoSlots(vd.next.?);
+                vp.mode = @intFromEnum(vd.interpolation);
+                vp.luma_b = @intFromEnum(nslots[0]);
+                vp.chroma_b = @intFromEnum(nslots[1]);
+                vp.vectors = @intFromEnum(fs.vectors_int.slot.?);
+                vp.cost = @intFromEnum(fs.cost.slot.?);
+                vp.debug_luma = @intFromEnum(fl.luma_slot[Flow.input]);
+                vp.back_vectors = @intFromEnum(fs.back_vectors_int.slot.?);
+                vp.alpha = vd.alpha;
+                vp.flow_size = .{ @floatFromInt(fl.width), @floatFromInt(fl.height) };
+                vp.grid_size = .{ @floatFromInt((fl.width + Flow.grid - 1) / Flow.grid), @floatFromInt((fl.height + Flow.grid - 1) / Flow.grid) };
+            }
             @memcpy(push[0..@sizeOf(VideoPush)], std.mem.asBytes(&vp));
             push_len = @sizeOf(VideoPush);
         } else if (program == .text) {

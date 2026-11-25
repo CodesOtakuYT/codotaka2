@@ -10,6 +10,11 @@ layout(push_constant, scalar) uniform Push {
     uint matrix, transfer, primaries, full_range, bit_depth, output_hdr;
     float white_scale;
     float peak;       // content peak, relative to reference white (HDR tone mapping)
+    uint mode, luma_b, chroma_b, vectors, cost;
+    float alpha;
+    vec2 flow_size, grid_size;
+    uint debug_luma;
+    uint back_vectors;
 } pc;
 
 layout(location = 0) out vec2 v_uv;

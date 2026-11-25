@@ -34,7 +34,8 @@ pub const Stats = struct {
     }
 };
 
-const lookahead = 2;
+/// Decoded frames held ahead of the shown one (interpolation needs the next two).
+const lookahead = 3;
 
 /// Picks the decoded frame for each predicted presentation time.
 const VideoView = struct {
@@ -61,6 +62,13 @@ const VideoView = struct {
     seek_target: i64 = 0,
     stats: Stats = .{},
     dirty: bool = false,
+    /// Motion-compensated interpolation (optical flow) between `current` and the next frame.
+    interpolation: Renderer.Interpolation = .off,
+    /// Position between `current` (0) and the next frame (1) at the predicted presentation.
+    alpha: f32 = 0,
+    /// Stable copy of the next frame for the renderer (owned by `pending`).
+    next_view: media.Frame = undefined,
+    after_view: media.Frame = undefined,
 
     fn deinit(self: *VideoView) void {
         for (self.pending.items) |*f| f.release();
@@ -190,9 +198,13 @@ const VideoView = struct {
             return .{ .dirty = false, .next_wake_ns = ft.now_ns + std.time.ns_per_ms * 5 };
         };
         // Newest frame due by the predicted presentation time; older ones are dropped.
+        // Interpolating, a frame becomes current once its time has come (the in-between
+        // images are synthesized); otherwise the nearest vsync rounds to the closest frame.
+        const interpolating = self.interpolation != .off and ft.refresh_ns != 0;
+        const slack: i128 = if (interpolating) 0 else @divFloor(@as(i128, ft.refresh_ns), 2);
         var pick: ?usize = null;
         for (self.pending.items, 0..) |f, idx| {
-            if (f.pts_ns <= media_time + @divFloor(@as(i128, ft.refresh_ns), 2)) pick = idx;
+            if (f.pts_ns <= media_time + slack) pick = idx;
         }
         var dirty = self.dirty;
         self.dirty = false;
@@ -207,6 +219,16 @@ const VideoView = struct {
             if (self.audio != null and @abs(self.current.?.pts_ns - media_time) > 20 * std.time.ns_per_ms) log.debug("sync err {d} ms pts {d} p={d} pending={d}", .{ @divTrunc(self.current.?.pts_ns - media_time, std.time.ns_per_ms), @divTrunc(self.current.?.stream_ns, std.time.ns_per_ms), p, self.pending.items.len });
             dirty = true;
         }
+        if (interpolating) if (self.current) |cur| if (self.pending.items.len > 0) {
+            // Every vsync shows a new in-between image.
+            const nxt = self.pending.items[0];
+            const span: f64 = @floatFromInt(nxt.pts_ns - cur.pts_ns);
+            const a: f32 = if (span > 0) @floatCast(std.math.clamp(@as(f64, @floatFromInt(media_time - cur.pts_ns)) / span, 0, 1)) else 0;
+            if (a != self.alpha) dirty = true;
+            self.alpha = a;
+            return .{ .dirty = dirty, .next_wake_ns = ft.wakeToPresentAt(ft.target_ns + ft.refresh_ns) };
+        };
+        self.alpha = 0;
         // Wake when the next frame becomes due at the predicted vsync (converted from media
         // time to monotonic time); if none is decoded yet, the decoder's eventfd wakes us.
         const next: ?i128 = if (self.pending.items.len > 0) blk: {
@@ -232,6 +254,16 @@ const VideoView = struct {
             .output_hdr = @intFromBool(ctx.color == .hdr_scrgb),
             .white_scale = ctx.white_scale,
         };
+        if (self.interpolation != .off and self.pending.items.len > 0 and self.paused_at == null and !self.seeking) {
+            self.next_view = self.pending.items[0];
+            vd.next = &self.next_view;
+            if (self.pending.items.len > 1) {
+                self.after_view = self.pending.items[1];
+                vd.after = &self.after_view;
+            }
+            vd.alpha = self.alpha;
+            vd.interpolation = self.interpolation;
+        }
         var d = frame.Draw.init(@intFromEnum(Program.video), [_]u32{0});
         d.data = std.mem.asBytes(vd);
         d.vertex_count = 6;
@@ -384,6 +416,10 @@ pub const Window = struct {
             .osd = .{ .gpa = gpa, .fonts = fonts, .video = undefined, .label_arena = .init(gpa) },
         };
         self.osd.video = &self.video;
+        // Initial interpolation mode (debug/testing): off, on, show_vectors, show_luma.
+        if (std.c.getenv("CODOTAKA_INTERPOLATION")) |v| if (std.meta.stringToEnum(Renderer.Interpolation, std.mem.span(v))) |m| {
+            self.video.interpolation = m;
+        };
         errdefer self.osd.label_arena.deinit();
         if (decoder.audioRing()) |ring| self.video.audio = media.Audio.Output.create(gpa, ring, "codotaka") catch |err| blk: {
             log.warn("no audio output: {t}", .{err});
@@ -487,6 +523,16 @@ pub const Window = struct {
             wl.keysym.Left => self.seekBy(-5 * std.time.ns_per_s),
             wl.keysym.Right => self.seekBy(5 * std.time.ns_per_s),
             wl.keysym.Home => self.seekBy(-self.video.position()),
+            wl.keysym.i => {
+                self.video.interpolation = switch (self.video.interpolation) {
+                    .off => .on,
+                    .on => .show_vectors,
+                    .show_vectors => .show_luma,
+                    .show_luma => .off,
+                };
+                self.video.dirty = true;
+                log.info("interpolation: {t}", .{self.video.interpolation});
+            },
             else => {},
         }
     }

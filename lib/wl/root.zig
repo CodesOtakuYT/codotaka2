@@ -65,6 +65,7 @@ pub const keysym = struct {
     pub const Left: u32 = c.XKB_KEY_Left;
     pub const Right: u32 = c.XKB_KEY_Right;
     pub const Home: u32 = c.XKB_KEY_Home;
+    pub const i: u32 = c.XKB_KEY_i;
 };
 
 pub const Button = struct {
